@@ -1,6 +1,5 @@
 ![image](https://github.com/user-attachments/assets/31a631e7-9c5b-4fd5-8f0b-bf4d554804be)
-
-# SimMovieMaker PySimpleGUI Installation and Usage Guide
+# SimMovieMaker Installation and Usage Guide
 
 ## Installation Requirements
 
@@ -9,32 +8,24 @@
 - pip (Python package installer)
 
 ### Required Libraries
-- PySimpleGUI
 - OpenCV (cv2)
 - NumPy
 - Pillow (PIL)
+- tkinter (usually included with Python)
 
 ## Installation Steps
 
 1. **Clone or download the code**
-   Save the `SimMovieMaker.py` file to your local machine.
+   Save the SimMovieMaker.py file to your local machine.
 
 2. **Install required dependencies**
    Open a terminal/command prompt and run:
    ```
-   pip install PySimpleGUI opencv-python numpy pillow
-   ```
-   
-   Or using conda:
-   ```
-   conda install -c conda-forge pysimplegui opencv numpy pillow
+   pip install opencv-python numpy pillow
    ```
 
-3. **Place your icon file**
-   Save your `smm.ico` file in the same directory as `SimMovieMaker.py`. This icon will be used for all windows in the application.
-
-4. **Run the application**
-   Navigate to the directory containing `SimMovieMaker.py` and run:
+3. **Run the application**
+   Navigate to the directory containing SimMovieMaker.py and run:
    ```
    python SimMovieMaker.py
    ```
@@ -50,17 +41,16 @@
 2. **Arrange Images**
    - Select an image in the list and use the ↑/↓ buttons to change its position
    - Use **Edit → Select All** to select all images
-   - Use **Edit → Delete Selected** or press **Delete** to remove unwanted images
+   - Use **Edit → Delete Selected** to remove unwanted images
 
 3. **Preview**
-   - Navigate through images using the ◀◀, ◀, ▶, ▶▶ buttons
+   - Navigate through images using the preview controls at the bottom
    - Click **Preview Video** to generate a temporary preview of your movie
 
 4. **Adjust Settings**
    - Set the frames per second (FPS) in the Properties panel
    - Select output format (mp4, avi, mov)
    - Choose video codec (H264, MJPG, XVID)
-   - Adjust quality slider for output file size/quality
 
 5. **Create Video**
    - Click the **Create Video** button
@@ -105,14 +95,6 @@ Command-line parameters:
 - **Video creation fails**: Check that all images have the same dimensions
 - **Images don't appear in the preview**: Verify that the file format is supported
 - **Poor video quality**: Try adjusting the codec or quality settings
-- **Performance issues**: For very large sets of images, consider using the command-line interface
-
-## Key Differences from Tkinter Version
-
-- **Simplified icon handling**: No special code needed for dialog icons
-- **More responsive UI**: Better handling of long operations with progress bars
-- **Modern appearance**: Theme support and better-looking controls
-- **Simplified codebase**: More intuitive, readable code structure
 
 ## Need Help?
 
