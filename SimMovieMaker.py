@@ -17,6 +17,7 @@ class SimMovieMaker:
     def __init__(self, root):
         self.root = root
         self.root.title("SimMovieMaker")
+        self.root.iconbitmap("oligo.ico")
         self.root.geometry("1200x800")
         
         # Project data
