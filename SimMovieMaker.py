@@ -19,6 +19,9 @@ class SimMovieMaker:
         self.root.title("SimMovieMaker")
         self.root.geometry("1200x800")
         
+        # Get the icon path
+        self.icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smm.ico")
+        
         # Project data
         self.project_file = None
         self.image_files = []
@@ -331,12 +334,14 @@ class SimMovieMaker:
         if not directory:
             return
         
-        # Ask for a pattern
-        pattern = tk.simpledialog.askstring(
+        # Ask for a pattern using our custom dialog approach
+        pattern = self.custom_askstring(
             "Image Sequence", 
             "Enter filename pattern (e.g. 'frame_*.png' or use * as wildcard):",
             initialvalue="*.png"
         )
+        if not pattern:
+            return
         if not pattern:
             return
         
@@ -522,13 +527,49 @@ class SimMovieMaker:
                 fill="white"
             )
     
+    # Custom dialog functions that apply our icon
+    def custom_askinteger(self, title, prompt, **kw):
+        """Custom askinteger function that applies our icon to the dialog"""
+        # Call the original askinteger
+        result = tk.simpledialog.askinteger(title, prompt, **kw, parent=self.root)
+        
+        # Find the dialog window and set its icon
+        # This needs to happen after the dialog is shown but before it's closed
+        for widget in self.root.winfo_children():
+            if isinstance(widget, tk.Toplevel) and widget.winfo_exists():
+                if widget.title() == title:
+                    try:
+                        if os.path.exists(self.icon_path):
+                            widget.iconbitmap(self.icon_path)
+                    except Exception:
+                        pass  # Silently fail if icon cannot be set
+        
+        return result
+    
+    def custom_askstring(self, title, prompt, **kw):
+        """Custom askstring function that applies our icon to the dialog"""
+        # Call the original askstring
+        result = tk.simpledialog.askstring(title, prompt, **kw, parent=self.root)
+        
+        # Find the dialog window and set its icon
+        for widget in self.root.winfo_children():
+            if isinstance(widget, tk.Toplevel) and widget.winfo_exists():
+                if widget.title() == title:
+                    try:
+                        if os.path.exists(self.icon_path):
+                            widget.iconbitmap(self.icon_path)
+                    except Exception:
+                        pass  # Silently fail if icon cannot be set
+        
+        return result
+        
     def create_preview(self):
         if not self.image_files or len(self.image_files) < 2:
             tk.messagebox.showinfo("Preview", "Need at least 2 images to create a preview.")
             return
         
-        # Ask for preview settings
-        preview_fps = tk.simpledialog.askinteger(
+        # Ask for preview settings using our custom dialog
+        preview_fps = self.custom_askinteger(
             "Preview FPS",
             "Enter frames per second for preview:",
             initialvalue=self.output_settings["fps"],
