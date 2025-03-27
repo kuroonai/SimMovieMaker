@@ -19,9 +19,6 @@ class SimMovieMaker:
         self.root.title("SimMovieMaker")
         self.root.geometry("1200x800")
         
-        # Get the icon path
-        self.icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smm.ico")
-        
         # Project data
         self.project_file = None
         self.image_files = []
@@ -334,11 +331,12 @@ class SimMovieMaker:
         if not directory:
             return
         
-        # Ask for a pattern using our custom dialog approach
-        pattern = self.custom_askstring(
+        # Ask for a pattern - now using the standard function since we patched the Dialog class
+        pattern = tk.simpledialog.askstring(
             "Image Sequence", 
             "Enter filename pattern (e.g. 'frame_*.png' or use * as wildcard):",
-            initialvalue="*.png"
+            initialvalue="*.png",
+            parent=self.root
         )
         if not pattern:
             return
@@ -568,14 +566,72 @@ class SimMovieMaker:
             tk.messagebox.showinfo("Preview", "Need at least 2 images to create a preview.")
             return
         
-        # Ask for preview settings using our custom dialog
-        preview_fps = self.custom_askinteger(
-            "Preview FPS",
-            "Enter frames per second for preview:",
-            initialvalue=self.output_settings["fps"],
-            minvalue=1,
-            maxvalue=60
-        )
+        # Create a custom integer input dialog to ensure the icon is applied
+        fps_dialog = tk.Toplevel(self.root)
+        fps_dialog.title("Preview FPS")
+        fps_dialog.geometry("300x120")
+        fps_dialog.transient(self.root)
+        fps_dialog.grab_set()
+        fps_dialog.resizable(False, False)
+        
+        # Try to set the icon explicitly
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smm.ico")
+        if os.path.exists(icon_path):
+            try:
+                fps_dialog.iconbitmap(icon_path)
+            except Exception:
+                pass
+                
+        # Add padding
+        frame = ttk.Frame(fps_dialog, padding=15)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Label
+        ttk.Label(frame, text="Enter frames per second for preview:").pack(anchor=tk.W, pady=(0, 10))
+        
+        # Spinbox for fps
+        fps_var = tk.IntVar(value=self.output_settings["fps"])
+        fps_spinbox = ttk.Spinbox(frame, from_=1, to=60, textvariable=fps_var, width=10)
+        fps_spinbox.pack(anchor=tk.W, pady=(0, 10))
+        
+        # Result variable
+        preview_fps = [None]  # Use a list to store result (mutable)
+        
+        # Button frame
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(fill=tk.X)
+        
+        def on_ok():
+            try:
+                value = int(fps_var.get())
+                if 1 <= value <= 60:
+                    preview_fps[0] = value
+                    fps_dialog.destroy()
+                else:
+                    tk.messagebox.showwarning("Invalid Input", "Value must be between 1 and 60.")
+            except ValueError:
+                tk.messagebox.showwarning("Invalid Input", "Please enter a valid number.")
+        
+        def on_cancel():
+            fps_dialog.destroy()
+        
+        ttk.Button(button_frame, text="OK", command=on_ok).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=5)
+        
+        # Set initial focus to the spinbox
+        fps_spinbox.focus_set()
+        
+        # Center the dialog on the main window
+        fps_dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - fps_dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - fps_dialog.winfo_height()) // 2
+        fps_dialog.geometry(f"+{x}+{y}")
+        
+        # Wait for the dialog to close
+        self.root.wait_window(fps_dialog)
+        
+        # Get the result
+        preview_fps = preview_fps[0]
         
         if not preview_fps:
             return
