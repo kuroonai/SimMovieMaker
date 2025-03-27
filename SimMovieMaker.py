@@ -17,7 +17,6 @@ class SimMovieMaker:
     def __init__(self, root):
         self.root = root
         self.root.title("SimMovieMaker")
-        self.root.iconbitmap("oligo.ico")
         self.root.geometry("1200x800")
         
         # Project data
@@ -553,6 +552,14 @@ class SimMovieMaker:
         progress.transient(self.root)
         progress.grab_set()
         
+        # If we have an icon, set it for this dialog too
+        try:
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smm.ico")
+            if os.path.exists(icon_path):
+                progress.iconbitmap(icon_path)
+        except Exception:
+            pass  # Silently fail if the icon cannot be set
+        
         ttk.Label(progress, text="Creating preview video...").pack(pady=10)
         
         progress_bar = ttk.Progressbar(progress, mode="determinate", maximum=len(preview_files))
@@ -669,6 +676,14 @@ class SimMovieMaker:
         progress.geometry("300x100")
         progress.transient(self.root)
         progress.grab_set()
+        
+        # If we have an icon, set it for this dialog too
+        try:
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smm.ico")
+            if os.path.exists(icon_path):
+                progress.iconbitmap(icon_path)
+        except Exception:
+            pass  # Silently fail if the icon cannot be set
         
         ttk.Label(progress, text="Creating video...").pack(pady=10)
         
@@ -1061,8 +1076,56 @@ def main():
     root = tk.Tk()
     root.title("SimMovieMaker")
     
-    # Set icon (would need an actual icon file in a real application)
-    # root.iconbitmap("icon.ico")
+    # Ensure icon is found regardless of working directory
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smm.ico")
+    if os.path.exists(icon_path):
+        try:
+            root.iconbitmap(icon_path)
+            
+            # Create a function to set icons for all dialogs
+            def set_icon_for_dialog(dialog):
+                try:
+                    dialog.iconbitmap(icon_path)
+                except Exception:
+                    pass  # Silently fail if icon cannot be set
+            
+            # Override the Toplevel class to automatically set icons
+            original_toplevel = tk.Toplevel
+            class IconifiedToplevel(original_toplevel):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    set_icon_for_dialog(self)
+            
+            # Replace Toplevel with our custom version
+            tk.Toplevel = IconifiedToplevel
+            
+        except tk.TclError:
+            print(f"Warning: Could not load icon file '{icon_path}'")
+    else:
+        print(f"Warning: Icon file not found at '{icon_path}'")
+    
+    # Set the application icon
+    try:
+        root.iconbitmap("smm.ico")
+    except tk.TclError:
+        print("Warning: Could not load icon file 'smm.ico'")
+    
+    # Function to set icon for all new windows
+    def set_window_icon(window):
+        try:
+            window.iconbitmap("smm.ico")
+        except tk.TclError:
+            pass  # Silently fail if icon cannot be set
+    
+    # Override Toplevel to automatically set icons
+    original_toplevel = tk.Toplevel
+    class IconifiedToplevel(original_toplevel):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            set_window_icon(self)
+    
+    # Replace the Toplevel class with our custom one
+    tk.Toplevel = IconifiedToplevel
     
     # Set minimum size
     root.minsize(800, 600)
