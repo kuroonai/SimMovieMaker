@@ -1,4 +1,7 @@
-# SimMovieMaker Installation and Usage Guide
+# SimMovieMaker 
+![image](https://github.com/user-attachments/assets/31a631e7-9c5b-4fd5-8f0b-bf4d554804be)
+
+Installation and Usage Guide
 
 ## Installation Requirements
 
