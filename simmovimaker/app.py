@@ -15,6 +15,8 @@ from tkinter import filedialog, ttk, messagebox, simpledialog
 from PIL import Image, ImageTk
 import json
 import threading
+import queue
+import time
 from datetime import datetime
 
 from .ffmpeg_utils import check_ffmpeg, get_ffmpeg_help_text, FFmpegNotFoundError
@@ -37,6 +39,10 @@ _VIDEO_EXTENSIONS = (
 )
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+THUMB_W = 80
+THUMB_H = 60
+THUMB_PAD = 4
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +102,224 @@ def _listbox_display(media_entry):
     return basename
 
 
+def _format_time_short(seconds):
+    """Format seconds as M:SS or H:MM:SS."""
+    if seconds is None or seconds < 0:
+        seconds = 0
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+# ---------------------------------------------------------------------------
+# ThumbnailStrip - horizontal scrollable thumbnail timeline
+# ---------------------------------------------------------------------------
+
+class ThumbnailStrip:
+    """Horizontal scrollable strip of thumbnails with background loading."""
+
+    def __init__(self, parent, on_select_callback):
+        self._on_select = on_select_callback
+        self._thumb_cache = {}          # key -> ImageTk.PhotoImage
+        self._items = []                # list of dicts describing each thumb slot
+        self._current_index = -1
+        self._generation = 0            # incremented on rebuild to cancel stale work
+        self._work_queue = queue.Queue()
+        self._placeholder = None        # gray placeholder PhotoImage
+
+        # -- widgets --
+        self.frame = ttk.Frame(parent)
+
+        self.canvas = tk.Canvas(self.frame, height=THUMB_H + THUMB_PAD * 2 + 18,
+                                bg="#2b2b2b", highlightthickness=0)
+        self.canvas.pack(side=tk.TOP, fill=tk.X, expand=True)
+
+        self.scrollbar = ttk.Scrollbar(self.frame, orient=tk.HORIZONTAL,
+                                       command=self.canvas.xview)
+        self.scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.config(xscrollcommand=self.scrollbar.set)
+
+        self.canvas.bind("<ButtonRelease-1>", self._on_click)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Shift-MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Configure>", lambda e: self._load_visible())
+
+        # Start the background worker
+        self._worker_thread = threading.Thread(target=self._thumb_worker,
+                                               daemon=True)
+        self._worker_thread.start()
+
+    # -- public API --
+
+    def set_items(self, items):
+        """items: list of dicts with 'path', 'type', and optionally 'time' (seconds)."""
+        self._generation += 1
+        self._thumb_cache.clear()
+        self._items = list(items)
+        self._current_index = -1
+        # drain queue
+        while not self._work_queue.empty():
+            try:
+                self._work_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._redraw_placeholders()
+        self._load_visible()
+
+    def set_current(self, index):
+        if index == self._current_index:
+            return
+        old = self._current_index
+        self._current_index = index
+        self._update_highlight(old)
+        self._update_highlight(index)
+        # scroll to make current visible
+        if 0 <= index < len(self._items):
+            total_w = len(self._items) * (THUMB_W + THUMB_PAD)
+            if total_w > 0:
+                frac = (index * (THUMB_W + THUMB_PAD)) / total_w
+                self.canvas.xview_moveto(max(0, frac - 0.1))
+
+    def clear(self):
+        self._generation += 1
+        self._items = []
+        self._thumb_cache.clear()
+        self._current_index = -1
+        self.canvas.delete("all")
+        self.canvas.config(scrollregion=(0, 0, 0, 0))
+
+    # -- internal --
+
+    def _redraw_placeholders(self):
+        self.canvas.delete("all")
+        total_w = len(self._items) * (THUMB_W + THUMB_PAD)
+        self.canvas.config(scrollregion=(0, 0, max(total_w, 1), THUMB_H + THUMB_PAD * 2 + 18))
+
+        for i, item in enumerate(self._items):
+            x = i * (THUMB_W + THUMB_PAD) + THUMB_PAD // 2
+            y = THUMB_PAD
+            # Gray placeholder
+            self.canvas.create_rectangle(x, y, x + THUMB_W, y + THUMB_H,
+                                         fill="#444444", outline="#555555",
+                                         tags=(f"bg_{i}",))
+            self.canvas.create_text(x + THUMB_W // 2, y + THUMB_H // 2,
+                                    text="...", fill="#888888",
+                                    tags=(f"placeholder_{i}",))
+            # Label below
+            label = os.path.basename(item.get("path", ""))
+            if len(label) > 10:
+                label = label[:9] + ".."
+            self.canvas.create_text(x + THUMB_W // 2, y + THUMB_H + 8,
+                                    text=label, fill="#aaaaaa",
+                                    font=("TkDefaultFont", 7),
+                                    tags=(f"label_{i}",))
+            # Highlight rect (hidden by default)
+            self.canvas.create_rectangle(x - 1, y - 1, x + THUMB_W + 1, y + THUMB_H + 1,
+                                         outline="#00aaff", width=2,
+                                         state=tk.HIDDEN,
+                                         tags=(f"hl_{i}",))
+
+    def _update_highlight(self, index):
+        if index < 0 or index >= len(self._items):
+            return
+        state = tk.NORMAL if index == self._current_index else tk.HIDDEN
+        self.canvas.itemconfig(f"hl_{index}", state=state)
+
+    def _on_click(self, event):
+        cx = self.canvas.canvasx(event.x)
+        idx = int(cx // (THUMB_W + THUMB_PAD))
+        if 0 <= idx < len(self._items):
+            self.set_current(idx)
+            self._on_select(idx)
+
+    def _on_mousewheel(self, event):
+        self.canvas.xview_scroll(-1 * (event.delta // 120), "units")
+        self.canvas.after(50, self._load_visible)
+
+    def _load_visible(self):
+        """Enqueue thumbnail generation for items currently in view."""
+        if not self._items:
+            return
+        # figure out visible range
+        try:
+            left = self.canvas.canvasx(0)
+            right = self.canvas.canvasx(self.canvas.winfo_width())
+        except Exception:
+            return
+        first = max(0, int(left // (THUMB_W + THUMB_PAD)) - 1)
+        last = min(len(self._items) - 1, int(right // (THUMB_W + THUMB_PAD)) + 1)
+
+        gen = self._generation
+        for i in range(first, last + 1):
+            key = (gen, i)
+            if key not in self._thumb_cache:
+                item = self._items[i]
+                self._work_queue.put((gen, i, item))
+
+    def _thumb_worker(self):
+        """Background thread that generates thumbnails from the queue."""
+        while True:
+            try:
+                gen, idx, item = self._work_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if gen != self._generation:
+                continue  # stale request
+            key = (gen, idx)
+            if key in self._thumb_cache:
+                continue  # already done
+
+            try:
+                pil_img = self._generate_thumbnail(item)
+                if gen != self._generation:
+                    continue
+                photo = ImageTk.PhotoImage(pil_img)
+                self._thumb_cache[key] = photo
+                # schedule canvas update on main thread
+                self.canvas.after(0, self._place_thumb, gen, idx, photo)
+            except Exception:
+                pass  # skip broken files silently
+
+    def _generate_thumbnail(self, item):
+        """Return a PIL Image thumbnail for the given item."""
+        path = item.get("path", "")
+        t = item.get("time")  # optional seek time for video
+
+        if item.get("type") == "video" or _is_video_file(path):
+            cap = cv2.VideoCapture(path)
+            if t is not None and t > 0:
+                cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret or frame is None:
+                return Image.new("RGB", (THUMB_W, THUMB_H), (68, 68, 68))
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb)
+        else:
+            img = Image.open(path)
+            img = img.convert("RGB")
+
+        img.thumbnail((THUMB_W, THUMB_H), Image.NEAREST)
+        # Paste onto exact-size canvas to keep uniform sizing
+        canvas_img = Image.new("RGB", (THUMB_W, THUMB_H), (43, 43, 43))
+        offset_x = (THUMB_W - img.width) // 2
+        offset_y = (THUMB_H - img.height) // 2
+        canvas_img.paste(img, (offset_x, offset_y))
+        return canvas_img
+
+    def _place_thumb(self, gen, idx, photo):
+        if gen != self._generation:
+            return
+        x = idx * (THUMB_W + THUMB_PAD) + THUMB_PAD // 2
+        y = THUMB_PAD
+        self.canvas.delete(f"placeholder_{idx}")
+        self.canvas.create_image(x, y, image=photo, anchor=tk.NW,
+                                 tags=(f"thumb_{idx}",))
+
+
 # ---------------------------------------------------------------------------
 # Main application class
 # ---------------------------------------------------------------------------
@@ -110,9 +334,9 @@ class SimMovieMaker:
     def __init__(self, root):
         self.root = root
         self.root.title("SimMovieMaker v2.0")
-        self.root.geometry("1200x800")
+        self.root.geometry("1200x900")
 
-        # Icon -------------------------------------------------------
+        # Icon
         self.icon_path = _find_icon_path()
         if self.icon_path:
             try:
@@ -121,13 +345,12 @@ class SimMovieMaker:
                 pass
         _install_icon_hook(self.root, self.icon_path)
 
-        # Project data -----------------------------------------------
+        # Project data
         self.project_file = None
-        # Unified media list: list of dicts {'path': str, 'type': 'image'|'video'}
-        self.media_files = []
+        self.media_files = []       # list of {'path': str, 'type': 'image'|'video'}
         self.selected_indices = []
         self.current_preview_index = 0
-        self.current_photo = None  # prevent GC of PhotoImage
+        self.current_photo = None   # prevent GC of PhotoImage
 
         self.output_settings = {
             "format": "mp4",
@@ -136,23 +359,36 @@ class SimMovieMaker:
             "quality": 80,
         }
 
-        # FFmpeg status (checked asynchronously) ----------------------
+        # FFmpeg status
         self.ffmpeg_status = None
 
-        # Build UI ----------------------------------------------------
+        # Playback state
+        self._playback_active = False
+        self._playback_after_id = None
+        self._playback_cap = None           # cv2.VideoCapture during video playback
+        self._playback_fps = 30.0
+        self._playback_frame_idx = 0
+        self._playback_total_frames = 0
+        self._playback_duration = 0.0       # seconds
+        self._slider_dragging = False
+
+        # Crop-region drawing state
+        self._crop_start = None
+        self._crop_rect_id = None
+
+        # Build UI
         self.create_menu_bar()
         self.create_layout()
 
-        # Kick off ffmpeg check in background
+        # Kick off ffmpeg check
         threading.Thread(target=self._check_ffmpeg_async, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # Backward-compat helpers for the old image_files list
+    # Backward-compat helpers
     # ------------------------------------------------------------------
 
     @property
     def image_files(self):
-        """Return a flat list of paths (images only) for backward compat."""
         return [m["path"] for m in self.media_files if m["type"] == "image"]
 
     # ------------------------------------------------------------------
@@ -168,7 +404,6 @@ class SimMovieMaker:
         self.root.after(0, self.status_var.set, msg)
 
     def _require_ffmpeg(self):
-        """Show a warning and return False if ffmpeg is not available."""
         if self.ffmpeg_status and self.ffmpeg_status["available"]:
             return True
         messagebox.showwarning(
@@ -185,7 +420,7 @@ class SimMovieMaker:
     def create_menu_bar(self):
         menubar = tk.Menu(self.root)
 
-        # -- File menu -------------------------------------------------
+        # -- File --
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="New Project", command=self.new_project)
         file_menu.add_command(label="Open Project", command=self.open_project)
@@ -199,7 +434,7 @@ class SimMovieMaker:
         file_menu.add_command(label="Exit", command=self.root.quit)
         menubar.add_cascade(label="File", menu=file_menu)
 
-        # -- Edit menu -------------------------------------------------
+        # -- Edit --
         edit_menu = tk.Menu(menubar, tearoff=0)
         edit_menu.add_command(label="Select All", command=self.select_all)
         edit_menu.add_command(label="Deselect All", command=self.deselect_all)
@@ -210,20 +445,20 @@ class SimMovieMaker:
         edit_menu.add_command(label="Move Down", command=lambda: self.move_selected(1))
         menubar.add_cascade(label="Edit", menu=edit_menu)
 
-        # -- Preview menu ----------------------------------------------
+        # -- Preview --
         preview_menu = tk.Menu(menubar, tearoff=0)
         preview_menu.add_command(label="Preview Current Frame", command=self.preview_current)
         preview_menu.add_command(label="Create Preview Video", command=self.create_preview)
         menubar.add_cascade(label="Preview", menu=preview_menu)
 
-        # -- Video (image->video creation) menu ------------------------
+        # -- Video (image->video) --
         video_create_menu = tk.Menu(menubar, tearoff=0)
         video_create_menu.add_command(label="Output Settings", command=self.show_output_settings)
         video_create_menu.add_separator()
         video_create_menu.add_command(label="Create Video", command=self.create_video)
         menubar.add_cascade(label="Video", menu=video_create_menu)
 
-        # -- Video Operations menu (ffmpeg) ----------------------------
+        # -- Video Ops (ffmpeg) --
         vidops_menu = tk.Menu(menubar, tearoff=0)
         vidops_menu.add_command(label="Merge Videos", command=self.merge_videos)
         vidops_menu.add_command(label="Split Video", command=self.split_video)
@@ -239,44 +474,43 @@ class SimMovieMaker:
         vidops_menu.add_command(label="Create GIF", command=self.create_gif)
         menubar.add_cascade(label="Video Ops", menu=vidops_menu)
 
-        # -- Filters menu ----------------------------------------------
+        # -- Filters --
         filter_menu = tk.Menu(menubar, tearoff=0)
-
         size_menu = tk.Menu(filter_menu, tearoff=0)
         size_menu.add_command(label="Crop", command=lambda: self.apply_filter("crop"))
         size_menu.add_command(label="Resize", command=lambda: self.apply_filter("resize"))
         size_menu.add_command(label="Rotate", command=lambda: self.apply_filter("rotate"))
         filter_menu.add_cascade(label="Adjust Size", menu=size_menu)
-
         color_menu = tk.Menu(filter_menu, tearoff=0)
         color_menu.add_command(label="Brightness", command=lambda: self.apply_filter("brightness"))
         color_menu.add_command(label="Contrast", command=lambda: self.apply_filter("contrast"))
         color_menu.add_command(label="Grayscale", command=lambda: self.apply_filter("grayscale"))
         filter_menu.add_cascade(label="Adjust Colors", menu=color_menu)
-
         overlay_menu = tk.Menu(filter_menu, tearoff=0)
         overlay_menu.add_command(label="Text Overlay", command=lambda: self.apply_filter("text_overlay"))
         overlay_menu.add_command(label="Scale Bar", command=lambda: self.apply_filter("scale_bar"))
         overlay_menu.add_command(label="Timestamp", command=lambda: self.apply_filter("timestamp"))
         filter_menu.add_cascade(label="Overlay", menu=overlay_menu)
-
         menubar.add_cascade(label="Filters", menu=filter_menu)
 
-        # -- Metadata menu ---------------------------------------------
+        # -- Metadata --
         meta_menu = tk.Menu(menubar, tearoff=0)
         meta_menu.add_command(label="View Metadata", command=self.view_metadata)
         meta_menu.add_command(label="Edit Metadata", command=self.edit_metadata)
-        meta_menu.add_command(label="Strip Metadata", command=self.strip_metadata)
+        meta_menu.add_separator()
+        meta_menu.add_command(label="Strip Metadata (Fast)", command=self.strip_metadata)
+        meta_menu.add_command(label="Strip Metadata (Deep - re-encode)",
+                              command=self.strip_metadata_deep)
         menubar.add_cascade(label="Metadata", menu=meta_menu)
 
-        # -- Tools menu ------------------------------------------------
+        # -- Tools --
         tools_menu = tk.Menu(menubar, tearoff=0)
         tools_menu.add_command(label="Batch Process", command=self.batch_process)
         tools_menu.add_command(label="Export File List", command=self.export_file_list)
         tools_menu.add_command(label="Import File List", command=self.import_file_list)
         menubar.add_cascade(label="Tools", menu=tools_menu)
 
-        # -- Help menu -------------------------------------------------
+        # -- Help --
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="Documentation", command=self.show_documentation)
         help_menu.add_separator()
@@ -289,130 +523,751 @@ class SimMovieMaker:
         self.root.config(menu=menubar)
 
     # ------------------------------------------------------------------
-    # Layout
+    # Layout  (preview top, media list bottom)
     # ------------------------------------------------------------------
 
     def create_layout(self):
-        # Main frame
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # Main container using grid for weight control
+        main = ttk.Frame(self.root)
+        main.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        main.rowconfigure(0, weight=3)   # preview
+        main.rowconfigure(1, weight=0)   # transport controls
+        main.rowconfigure(2, weight=0)   # thumbnail strip
+        main.rowconfigure(3, weight=1)   # bottom panel (list + props)
+        main.columnconfigure(0, weight=1)
 
-        # Split into left and right panels
-        panel = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
-        panel.pack(fill=tk.BOTH, expand=True)
+        # ---- ROW 0: Preview canvas ----
+        preview_frame = ttk.Frame(main, relief=tk.SUNKEN, borderwidth=1)
+        preview_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        preview_frame.rowconfigure(0, weight=1)
+        preview_frame.columnconfigure(0, weight=1)
 
-        # -- Left panel: file list ------------------------------------
-        left_frame = ttk.Frame(panel, width=400)
-        panel.add(left_frame)
+        self.preview_canvas = tk.Canvas(preview_frame, bg="black",
+                                        highlightthickness=0)
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
 
-        ttk.Label(left_frame, text="Media Files").pack(anchor=tk.W, pady=(0, 5))
+        # Bind for crop-region drawing
+        self.preview_canvas.bind("<ButtonPress-1>", self._crop_mouse_down)
+        self.preview_canvas.bind("<B1-Motion>", self._crop_mouse_drag)
+        self.preview_canvas.bind("<ButtonRelease-1>", self._crop_mouse_up)
 
-        list_frame = ttk.Frame(left_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True)
+        # ---- ROW 1: Transport controls ----
+        transport = ttk.Frame(main)
+        transport.grid(row=1, column=0, sticky="ew", pady=2)
+        transport.columnconfigure(1, weight=1)  # slider stretches
 
-        self.file_listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED)
+        # Row 1a: buttons + time + slider
+        btn_row = ttk.Frame(transport)
+        btn_row.pack(fill=tk.X)
+
+        ttk.Button(btn_row, text="<<", width=3,
+                   command=self._transport_first).pack(side=tk.LEFT, padx=1)
+        ttk.Button(btn_row, text="<", width=3,
+                   command=self._transport_prev).pack(side=tk.LEFT, padx=1)
+        self._play_btn = ttk.Button(btn_row, text="Play", width=6,
+                                    command=self._transport_play_pause)
+        self._play_btn.pack(side=tk.LEFT, padx=1)
+        ttk.Button(btn_row, text="Stop", width=4,
+                   command=self._transport_stop).pack(side=tk.LEFT, padx=1)
+        ttk.Button(btn_row, text=">", width=3,
+                   command=self._transport_next).pack(side=tk.LEFT, padx=1)
+        ttk.Button(btn_row, text=">>", width=3,
+                   command=self._transport_last).pack(side=tk.LEFT, padx=1)
+
+        self._time_label = ttk.Label(btn_row, text="0:00 / 0:00", width=16)
+        self._time_label.pack(side=tk.LEFT, padx=8)
+
+        # Action buttons on right side of transport
+        ttk.Button(btn_row, text="Mute Section",
+                   command=self._mute_section).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btn_row, text="Trim Section",
+                   command=self._trim_section).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btn_row, text="Crop Region",
+                   command=self._start_crop_region).pack(side=tk.RIGHT, padx=2)
+
+        # Slider row
+        slider_row = ttk.Frame(transport)
+        slider_row.pack(fill=tk.X, pady=(2, 0))
+
+        self._position_var = tk.DoubleVar(value=0)
+        self._position_slider = ttk.Scale(slider_row, from_=0, to=100,
+                                          orient=tk.HORIZONTAL,
+                                          variable=self._position_var,
+                                          command=self._on_slider_move)
+        self._position_slider.pack(fill=tk.X, padx=4)
+        self._position_slider.bind("<ButtonPress-1>", self._slider_press)
+        self._position_slider.bind("<ButtonRelease-1>", self._slider_release)
+
+        # ---- ROW 2: Thumbnail strip ----
+        self.thumb_strip = ThumbnailStrip(main, on_select_callback=self._on_thumb_select)
+        self.thumb_strip.frame.grid(row=2, column=0, sticky="ew", pady=4)
+
+        # ---- ROW 3: Bottom panel (file list + properties) ----
+        bottom = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        bottom.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
+
+        # -- Left: media file list --
+        list_frame = ttk.Frame(bottom)
+        bottom.add(list_frame, weight=2)
+
+        ttk.Label(list_frame, text="Media Files").pack(anchor=tk.W, pady=(0, 3))
+
+        lb_frame = ttk.Frame(list_frame)
+        lb_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.file_listbox = tk.Listbox(lb_frame, selectmode=tk.EXTENDED)
         self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.file_listbox.bind("<<ListboxSelect>>", self.on_file_select)
 
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.file_listbox.config(yscrollcommand=scrollbar.set)
+        lb_scroll = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL,
+                                  command=self.file_listbox.yview)
+        lb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.file_listbox.config(yscrollcommand=lb_scroll.set)
 
-        # Buttons under list
-        button_frame = ttk.Frame(left_frame)
-        button_frame.pack(fill=tk.X, pady=5)
+        btn_bar = ttk.Frame(list_frame)
+        btn_bar.pack(fill=tk.X, pady=4)
 
-        ttk.Button(button_frame, text="Add Files", command=self.import_images).pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="Add Videos", command=self.import_videos).pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="Remove", command=self.delete_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="Up", width=3, command=lambda: self.move_selected(-1)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="Down", width=3, command=lambda: self.move_selected(1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_bar, text="Add Files",
+                   command=self.import_images).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_bar, text="Add Videos",
+                   command=self.import_videos).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_bar, text="Remove",
+                   command=self.delete_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_bar, text="Up", width=3,
+                   command=lambda: self.move_selected(-1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_bar, text="Down", width=3,
+                   command=lambda: self.move_selected(1)).pack(side=tk.LEFT, padx=2)
 
-        # -- Right panel: preview and properties ----------------------
-        right_frame = ttk.Frame(panel)
-        panel.add(right_frame)
+        # -- Right: properties --
+        props_frame = ttk.Frame(bottom)
+        bottom.add(props_frame, weight=1)
 
-        ttk.Label(right_frame, text="Preview").pack(anchor=tk.W, pady=(0, 5))
+        props_lf = ttk.LabelFrame(props_frame, text="Output Properties")
+        props_lf.pack(fill=tk.X, padx=(4, 0), pady=(0, 4))
 
-        self.preview_frame = ttk.Frame(right_frame, relief=tk.SUNKEN, borderwidth=1)
-        self.preview_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-
-        self.preview_canvas = tk.Canvas(self.preview_frame, bg="black")
-        self.preview_canvas.pack(fill=tk.BOTH, expand=True)
-
-        # Preview navigation
-        controls_frame = ttk.Frame(right_frame)
-        controls_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Button(controls_frame, text="<<", width=3, command=self.preview_first).pack(side=tk.LEFT, padx=2)
-        ttk.Button(controls_frame, text="<", width=3, command=self.preview_previous).pack(side=tk.LEFT, padx=2)
-
-        self.preview_label = ttk.Label(controls_frame, text="0/0")
-        self.preview_label.pack(side=tk.LEFT, padx=10)
-
-        ttk.Button(controls_frame, text=">", width=3, command=self.preview_next).pack(side=tk.LEFT, padx=2)
-        ttk.Button(controls_frame, text=">>", width=3, command=self.preview_last).pack(side=tk.LEFT, padx=2)
-        ttk.Button(controls_frame, text="Preview Video", command=self.create_preview).pack(side=tk.RIGHT, padx=2)
-
-        # Properties (output settings)
-        properties_frame = ttk.LabelFrame(right_frame, text="Output Properties")
-        properties_frame.pack(fill=tk.X, pady=10)
-
-        # FPS
-        fps_frame = ttk.Frame(properties_frame)
-        fps_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(fps_frame, text="FPS:").pack(side=tk.LEFT)
+        fps_f = ttk.Frame(props_lf)
+        fps_f.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(fps_f, text="FPS:").pack(side=tk.LEFT)
         self.fps_var = tk.StringVar(value=str(self.output_settings["fps"]))
-        fps_spinbox = ttk.Spinbox(fps_frame, from_=1, to=120, textvariable=self.fps_var, width=5)
-        fps_spinbox.pack(side=tk.LEFT, padx=5)
-        fps_spinbox.bind("<<SpinboxSelected>>", self.update_fps)
+        fps_sb = ttk.Spinbox(fps_f, from_=1, to=120,
+                             textvariable=self.fps_var, width=5)
+        fps_sb.pack(side=tk.LEFT, padx=5)
+        fps_sb.bind("<<SpinboxSelected>>", self.update_fps)
 
-        # Format
-        format_frame = ttk.Frame(properties_frame)
-        format_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(format_frame, text="Format:").pack(side=tk.LEFT)
+        fmt_f = ttk.Frame(props_lf)
+        fmt_f.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(fmt_f, text="Format:").pack(side=tk.LEFT)
         self.format_var = tk.StringVar(value=self.output_settings["format"])
-        format_combo = ttk.Combobox(format_frame, textvariable=self.format_var,
-                                    values=["mp4", "avi", "mov", "webm"], width=5)
-        format_combo.pack(side=tk.LEFT, padx=5)
-        format_combo.bind("<<ComboboxSelected>>", self.update_format)
+        fmt_cb = ttk.Combobox(fmt_f, textvariable=self.format_var,
+                              values=["mp4", "avi", "mov", "webm"], width=5)
+        fmt_cb.pack(side=tk.LEFT, padx=5)
+        fmt_cb.bind("<<ComboboxSelected>>", self.update_format)
 
-        # Codec
-        codec_frame = ttk.Frame(properties_frame)
-        codec_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(codec_frame, text="Codec:").pack(side=tk.LEFT)
+        codec_f = ttk.Frame(props_lf)
+        codec_f.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(codec_f, text="Codec:").pack(side=tk.LEFT)
         self.codec_var = tk.StringVar(value=self.output_settings["codec"])
-        codec_combo = ttk.Combobox(codec_frame, textvariable=self.codec_var,
-                                   values=["H264", "MJPG", "XVID", "VP9"], width=5)
-        codec_combo.pack(side=tk.LEFT, padx=5)
-        codec_combo.bind("<<ComboboxSelected>>", self.update_codec)
+        codec_cb = ttk.Combobox(codec_f, textvariable=self.codec_var,
+                                values=["H264", "MJPG", "XVID", "VP9"], width=5)
+        codec_cb.pack(side=tk.LEFT, padx=5)
+        codec_cb.bind("<<ComboboxSelected>>", self.update_codec)
 
-        # Video info label (shown when a video is selected)
-        self.video_info_label = ttk.Label(right_frame, text="", wraplength=500,
+        # Video info label
+        self.video_info_label = ttk.Label(props_frame, text="", wraplength=350,
                                           foreground="gray")
-        self.video_info_label.pack(fill=tk.X, pady=(0, 5))
+        self.video_info_label.pack(fill=tk.X, padx=(4, 0), pady=4)
 
-        # Create Video button
-        ttk.Button(right_frame, text="Create Video", command=self.create_video).pack(anchor=tk.E, pady=10)
+        ttk.Button(props_frame, text="Create Video",
+                   command=self.create_video).pack(anchor=tk.E, padx=(4, 0), pady=4)
 
-        # Status bar
+        # ---- Status bar ----
         self.status_var = tk.StringVar(value="Starting up...")
         status_bar = ttk.Label(self.root, textvariable=self.status_var,
                                relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     # ------------------------------------------------------------------
+    # Thumbnail strip callbacks
+    # ------------------------------------------------------------------
+
+    def _on_thumb_select(self, index):
+        """Called when the user clicks a thumbnail in the strip."""
+        if self._is_single_video_mode():
+            # index = frame/time index within the video
+            self._seek_video_to_thumb(index)
+        else:
+            if 0 <= index < len(self.media_files):
+                self.current_preview_index = index
+                self.file_listbox.selection_clear(0, tk.END)
+                self.file_listbox.selection_set(index)
+                self.file_listbox.see(index)
+                self.update_preview()
+
+    def _rebuild_thumb_strip(self):
+        """Rebuild the thumbnail strip based on current state."""
+        if self._is_single_video_mode():
+            path = self.media_files[self.current_preview_index]["path"]
+            self._build_video_thumbs(path)
+        else:
+            items = [{"path": m["path"], "type": m["type"]}
+                     for m in self.media_files]
+            self.thumb_strip.set_items(items)
+            self.thumb_strip.set_current(self.current_preview_index)
+
+    def _build_video_thumbs(self, video_path):
+        """Build thumbnail strip items for a single video at time intervals."""
+        try:
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            cap.release()
+            duration = total / fps if fps > 0 else 0
+        except Exception:
+            duration = 0
+
+        if duration <= 0:
+            self.thumb_strip.clear()
+            return
+
+        # At most 50 thumbnails, spaced evenly
+        n_thumbs = min(50, max(10, int(duration / 2)))
+        interval = duration / n_thumbs
+        items = []
+        for i in range(n_thumbs):
+            t = i * interval
+            items.append({"path": video_path, "type": "video", "time": t})
+        self.thumb_strip.set_items(items)
+
+    def _seek_video_to_thumb(self, thumb_index):
+        """Seek the video preview to the time represented by thumb_index."""
+        items = self.thumb_strip._items
+        if thumb_index < 0 or thumb_index >= len(items):
+            return
+        t = items[thumb_index].get("time", 0)
+        path = items[thumb_index]["path"]
+
+        try:
+            cap = cv2.VideoCapture(path)
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            cap.release()
+            if ret and frame is not None:
+                self._display_cv2_frame(frame)
+                duration = total_frames / fps if fps > 0 else 0
+                self._time_label.config(
+                    text=f"{_format_time_short(t)} / {_format_time_short(duration)}")
+                if duration > 0:
+                    self._position_var.set(t / duration * 100)
+        except Exception:
+            pass
+        self.thumb_strip.set_current(thumb_index)
+
+    def _is_single_video_mode(self):
+        """True if exactly one video is selected/current in the list."""
+        if not self.media_files:
+            return False
+        if len(self.media_files) == 1 and self.media_files[0]["type"] == "video":
+            return True
+        if (self.selected_indices and len(self.selected_indices) == 1):
+            idx = self.selected_indices[0]
+            if idx < len(self.media_files) and self.media_files[idx]["type"] == "video":
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Transport controls (play/pause/stop/seek)
+    # ------------------------------------------------------------------
+
+    def _transport_play_pause(self):
+        if self._playback_active:
+            self._pause_playback()
+        else:
+            self._start_playback()
+
+    def _transport_stop(self):
+        self._stop_playback()
+
+    def _transport_first(self):
+        self._stop_playback()
+        if self._is_single_video_mode():
+            self._seek_video_frame(0)
+        else:
+            self.current_preview_index = 0
+            self.update_preview()
+            self.thumb_strip.set_current(0)
+
+    def _transport_last(self):
+        self._stop_playback()
+        if self._is_single_video_mode():
+            if self._playback_total_frames > 0:
+                self._seek_video_frame(self._playback_total_frames - 1)
+        else:
+            if self.media_files:
+                self.current_preview_index = len(self.media_files) - 1
+                self.update_preview()
+                self.thumb_strip.set_current(self.current_preview_index)
+
+    def _transport_prev(self):
+        if self._playback_active:
+            self._pause_playback()
+        if self._is_single_video_mode():
+            new_idx = max(0, self._playback_frame_idx - 1)
+            self._seek_video_frame(new_idx)
+        else:
+            self.current_preview_index = max(0, self.current_preview_index - 1)
+            self.update_preview()
+            self.thumb_strip.set_current(self.current_preview_index)
+
+    def _transport_next(self):
+        if self._playback_active:
+            self._pause_playback()
+        if self._is_single_video_mode():
+            new_idx = min(self._playback_total_frames - 1,
+                          self._playback_frame_idx + 1)
+            self._seek_video_frame(new_idx)
+        else:
+            if self.media_files:
+                self.current_preview_index = min(len(self.media_files) - 1,
+                                                 self.current_preview_index + 1)
+                self.update_preview()
+                self.thumb_strip.set_current(self.current_preview_index)
+
+    def _start_playback(self):
+        if not self.media_files:
+            return
+
+        if self._is_single_video_mode():
+            idx = self.selected_indices[0] if self.selected_indices else 0
+            path = self.media_files[idx]["path"]
+            self._start_video_playback(path)
+        else:
+            self._start_image_playback()
+
+    def _start_image_playback(self):
+        """Play through images in the media list as a slideshow."""
+        images = self.image_files
+        if len(images) < 2:
+            return
+        try:
+            fps = int(self.fps_var.get())
+        except ValueError:
+            fps = 30
+        self._playback_fps = fps
+        self._playback_active = True
+        self._play_btn.config(text="Pause")
+        self._playback_total_frames = len(self.media_files)
+        self._playback_duration = self._playback_total_frames / fps
+        self._image_playback_tick()
+
+    def _image_playback_tick(self):
+        if not self._playback_active:
+            return
+        if self.current_preview_index >= len(self.media_files) - 1:
+            self._stop_playback()
+            return
+
+        self.current_preview_index += 1
+        self.update_preview()
+        self.thumb_strip.set_current(self.current_preview_index)
+        self._update_transport_display_images()
+
+        interval = max(1, int(1000 / self._playback_fps))
+        self._playback_after_id = self.root.after(interval,
+                                                  self._image_playback_tick)
+
+    def _update_transport_display_images(self):
+        idx = self.current_preview_index
+        total = len(self.media_files)
+        cur_t = idx / self._playback_fps if self._playback_fps > 0 else 0
+        tot_t = total / self._playback_fps if self._playback_fps > 0 else 0
+        self._time_label.config(
+            text=f"{_format_time_short(cur_t)} / {_format_time_short(tot_t)}")
+        if total > 1:
+            self._position_var.set(idx / (total - 1) * 100)
+
+    def _start_video_playback(self, path):
+        """Start playing a video file frame by frame."""
+        if self._playback_cap is not None:
+            self._playback_cap.release()
+
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            messagebox.showerror("Error", f"Cannot open video: {path}")
+            return
+
+        self._playback_cap = cap
+        self._playback_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        self._playback_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self._playback_duration = (self._playback_total_frames / self._playback_fps
+                                   if self._playback_fps > 0 else 0)
+
+        # Seek to current position if resuming
+        if self._playback_frame_idx > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, self._playback_frame_idx)
+
+        self._playback_active = True
+        self._play_btn.config(text="Pause")
+        self._position_slider.config(to=100)
+        self._video_playback_tick()
+
+    def _video_playback_tick(self):
+        if not self._playback_active or self._playback_cap is None:
+            return
+
+        ret, frame = self._playback_cap.read()
+        if not ret:
+            self._stop_playback()
+            return
+
+        self._playback_frame_idx = int(
+            self._playback_cap.get(cv2.CAP_PROP_POS_FRAMES))
+
+        self._display_cv2_frame(frame)
+        self._update_transport_display_video()
+
+        interval = max(1, int(1000 / self._playback_fps))
+        self._playback_after_id = self.root.after(interval,
+                                                  self._video_playback_tick)
+
+    def _update_transport_display_video(self):
+        if self._playback_fps <= 0:
+            return
+        cur_t = self._playback_frame_idx / self._playback_fps
+        self._time_label.config(
+            text=f"{_format_time_short(cur_t)} / "
+                 f"{_format_time_short(self._playback_duration)}")
+        if not self._slider_dragging and self._playback_duration > 0:
+            pct = cur_t / self._playback_duration * 100
+            self._position_var.set(pct)
+
+    def _pause_playback(self):
+        self._playback_active = False
+        self._play_btn.config(text="Play")
+        if self._playback_after_id:
+            self.root.after_cancel(self._playback_after_id)
+            self._playback_after_id = None
+
+    def _stop_playback(self):
+        self._pause_playback()
+        self._playback_frame_idx = 0
+        if self._playback_cap is not None:
+            self._playback_cap.release()
+            self._playback_cap = None
+        self._position_var.set(0)
+        self._time_label.config(
+            text=f"0:00 / {_format_time_short(self._playback_duration)}")
+        self._play_btn.config(text="Play")
+
+    def _seek_video_frame(self, frame_idx):
+        """Seek to a specific frame in single-video mode and display it."""
+        if not self._is_single_video_mode():
+            return
+        idx = self.selected_indices[0] if self.selected_indices else 0
+        path = self.media_files[idx]["path"]
+
+        try:
+            cap = self._playback_cap
+            if cap is None or not cap.isOpened():
+                cap = cv2.VideoCapture(path)
+                self._playback_cap = cap
+                self._playback_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                self._playback_total_frames = int(
+                    cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                self._playback_duration = (
+                    self._playback_total_frames / self._playback_fps
+                    if self._playback_fps > 0 else 0)
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                self._playback_frame_idx = frame_idx
+                self._display_cv2_frame(frame)
+                self._update_transport_display_video()
+        except Exception:
+            pass
+
+    # -- Slider interaction --
+
+    def _slider_press(self, event):
+        self._slider_dragging = True
+
+    def _slider_release(self, event):
+        self._slider_dragging = False
+        self._on_slider_seek()
+
+    def _on_slider_move(self, value):
+        """Called as the slider is dragged (live feedback)."""
+        if not self._slider_dragging:
+            return
+        # Show time label update while dragging
+        pct = float(value)
+        if self._is_single_video_mode() and self._playback_duration > 0:
+            t = pct / 100 * self._playback_duration
+            self._time_label.config(
+                text=f"{_format_time_short(t)} / "
+                     f"{_format_time_short(self._playback_duration)}")
+
+    def _on_slider_seek(self):
+        """Seek to the position indicated by the slider."""
+        pct = self._position_var.get()
+        if self._is_single_video_mode():
+            if self._playback_duration > 0 and self._playback_fps > 0:
+                t = pct / 100 * self._playback_duration
+                frame_idx = int(t * self._playback_fps)
+                frame_idx = max(0, min(frame_idx,
+                                       self._playback_total_frames - 1))
+                self._seek_video_frame(frame_idx)
+        else:
+            if self.media_files:
+                idx = int(pct / 100 * (len(self.media_files) - 1))
+                idx = max(0, min(idx, len(self.media_files) - 1))
+                self.current_preview_index = idx
+                self.update_preview()
+                self.thumb_strip.set_current(idx)
+
+    # ------------------------------------------------------------------
+    # Section editing tools (transport bar)
+    # ------------------------------------------------------------------
+
+    def _mute_section(self):
+        """Mute audio in a time range of the selected video."""
+        if not self._require_ffmpeg():
+            return
+        path = self._get_selected_video_path()
+        if not path:
+            messagebox.showinfo("Mute Section",
+                                "Select a video file in the list first.")
+            return
+
+        try:
+            info = video_ops.get_video_info(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read video: {e}")
+            return
+
+        dlg = TrimDialog(self.root, info["duration"])
+        self.root.wait_window(dlg)
+        if dlg.result is None:
+            return
+
+        start_t, end_t = dlg.result
+        base, ext = os.path.splitext(path)
+        default_name = f"{os.path.basename(base)}_muted_section{ext}"
+
+        output_file = filedialog.asksaveasfilename(
+            title="Save Video With Muted Section",
+            initialfile=default_name,
+            defaultextension=ext,
+            filetypes=[("Video files", f"*{ext}"), ("All files", "*.*")],
+        )
+        if not output_file:
+            return
+
+        def op(cb):
+            from .ffmpeg_utils import run_ffmpeg
+            args = [
+                "-i", path,
+                "-af",
+                f"volume=enable='between(t,{start_t},{end_t})':volume=0",
+                "-c:v", "copy",
+                "-y", output_file,
+            ]
+            run_ffmpeg(args, progress_callback=cb)
+            return f"Audio muted from {_format_time_short(start_t)} to " \
+                   f"{_format_time_short(end_t)}.\nSaved to:\n{output_file}"
+
+        self._run_video_op("Muting Section", op)
+
+    def _trim_section(self):
+        """Trim the selected video - opens trim dialog with convenience."""
+        self.trim_video()
+
+    def _start_crop_region(self):
+        """Enable crop-region drawing mode on the preview canvas."""
+        if not self.media_files:
+            messagebox.showinfo("Crop Region", "No media loaded.")
+            return
+        self._crop_mode = True
+        self._crop_start = None
+        self.status_var.set("Crop mode: click and drag on the preview to select a region")
+        self.preview_canvas.config(cursor="crosshair")
+
+    _crop_mode = False
+
+    def _crop_mouse_down(self, event):
+        if not self._crop_mode:
+            return
+        self._crop_start = (event.x, event.y)
+        if self._crop_rect_id:
+            self.preview_canvas.delete(self._crop_rect_id)
+        self._crop_rect_id = self.preview_canvas.create_rectangle(
+            event.x, event.y, event.x, event.y,
+            outline="#00ff00", width=2, dash=(4, 4))
+
+    def _crop_mouse_drag(self, event):
+        if not self._crop_mode or self._crop_start is None:
+            return
+        x0, y0 = self._crop_start
+        self.preview_canvas.coords(self._crop_rect_id, x0, y0, event.x, event.y)
+
+    def _crop_mouse_up(self, event):
+        if not self._crop_mode or self._crop_start is None:
+            return
+        self._crop_mode = False
+        self.preview_canvas.config(cursor="")
+
+        x0, y0 = self._crop_start
+        x1, y1 = event.x, event.y
+        self._crop_start = None
+
+        # Normalize
+        left, right = min(x0, x1), max(x0, x1)
+        top, bottom = min(y0, y1), max(y0, y1)
+
+        if right - left < 5 or bottom - top < 5:
+            if self._crop_rect_id:
+                self.preview_canvas.delete(self._crop_rect_id)
+            self.status_var.set("Crop cancelled - region too small")
+            return
+
+        # Convert canvas coords to image coords
+        canvas_w = self.preview_canvas.winfo_width()
+        canvas_h = self.preview_canvas.winfo_height()
+
+        # Get current media dimensions
+        entry = self.media_files[self.current_preview_index]
+        try:
+            if entry["type"] == "video":
+                cap = cv2.VideoCapture(entry["path"])
+                img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
+            else:
+                img = Image.open(entry["path"])
+                img_w, img_h = img.size
+        except Exception:
+            self.status_var.set("Could not determine image dimensions")
+            return
+
+        scale = min(canvas_w / img_w, canvas_h / img_h)
+        disp_w = int(img_w * scale)
+        disp_h = int(img_h * scale)
+        offset_x = (canvas_w - disp_w) // 2
+        offset_y = (canvas_h - disp_h) // 2
+
+        # Map canvas coords to image coords
+        crop_left = int((left - offset_x) / scale)
+        crop_top = int((top - offset_y) / scale)
+        crop_right = int((right - offset_x) / scale)
+        crop_bottom = int((bottom - offset_y) / scale)
+
+        # Clamp
+        crop_left = max(0, min(crop_left, img_w))
+        crop_top = max(0, min(crop_top, img_h))
+        crop_right = max(0, min(crop_right, img_w))
+        crop_bottom = max(0, min(crop_bottom, img_h))
+
+        if self._crop_rect_id:
+            self.preview_canvas.delete(self._crop_rect_id)
+
+        if crop_right - crop_left < 2 or crop_bottom - crop_top < 2:
+            self.status_var.set("Crop cancelled - region outside image")
+            return
+
+        result = messagebox.askyesnocancel(
+            "Apply Crop",
+            f"Crop region: ({crop_left}, {crop_top}) to ({crop_right}, {crop_bottom})\n"
+            f"Size: {crop_right - crop_left} x {crop_bottom - crop_top}\n\n"
+            "Yes = Apply to all selected images\n"
+            "No = Apply to current image only\n"
+            "Cancel = Discard",
+        )
+        if result is None:
+            self.status_var.set("Crop cancelled")
+            return
+
+        if entry["type"] == "video":
+            # For video, use ffmpeg crop filter
+            if not self._require_ffmpeg():
+                return
+            w = crop_right - crop_left
+            h = crop_bottom - crop_top
+            base, ext = os.path.splitext(entry["path"])
+            out = filedialog.asksaveasfilename(
+                title="Save Cropped Video",
+                initialfile=f"{os.path.basename(base)}_cropped{ext}",
+                defaultextension=ext)
+            if not out:
+                return
+
+            def op(cb):
+                from .ffmpeg_utils import run_ffmpeg
+                args = [
+                    "-i", entry["path"],
+                    "-vf", f"crop={w}:{h}:{crop_left}:{crop_top}",
+                    "-c:a", "copy",
+                    "-y", out,
+                ]
+                run_ffmpeg(args, progress_callback=cb)
+                return f"Cropped video saved to:\n{out}"
+            self._run_video_op("Cropping Video", op)
+        else:
+            # Image crop
+            cl, ct, cr, cb = crop_left, crop_top, crop_right, crop_bottom
+
+            def _do_crop(img):
+                return img[ct:cb, cl:cr]
+
+            if result:  # Yes = all selected
+                self._apply_cv2_filter_to_selected(_do_crop, "Crop")
+            else:  # No = current only
+                p = entry["path"]
+                img = cv2.imread(p)
+                if img is not None:
+                    cv2.imwrite(p, _do_crop(img))
+                    self.update_preview()
+                    self.status_var.set("Crop applied to current image")
+
+    # ------------------------------------------------------------------
+    # Display helpers
+    # ------------------------------------------------------------------
+
+    def _display_cv2_frame(self, frame):
+        """Display an OpenCV BGR frame on the preview canvas."""
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+
+        canvas_w = self.preview_canvas.winfo_width()
+        canvas_h = self.preview_canvas.winfo_height()
+        if canvas_w <= 1 or canvas_h <= 1:
+            return
+
+        img_w, img_h = img.size
+        scale = min(canvas_w / img_w, canvas_h / img_h)
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+
+        img_resized = img.resize((new_w, new_h), Image.BILINEAR)
+        photo = ImageTk.PhotoImage(img_resized)
+        self.current_photo = photo
+
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(
+            canvas_w // 2, canvas_h // 2,
+            image=photo, anchor=tk.CENTER)
+
+    # ------------------------------------------------------------------
     # Listbox helpers
     # ------------------------------------------------------------------
 
     def _refresh_listbox(self):
-        """Rebuild the listbox from self.media_files."""
         self.file_listbox.delete(0, tk.END)
         for entry in self.media_files:
             self.file_listbox.insert(tk.END, _listbox_display(entry))
 
     def _get_selected_video_path(self):
-        """Return the path of the first selected video file, or None."""
         indices = list(self.file_listbox.curselection())
         for idx in indices:
             if idx < len(self.media_files) and self.media_files[idx]["type"] == "video":
@@ -420,7 +1275,6 @@ class SimMovieMaker:
         return None
 
     def _get_selected_video_paths(self):
-        """Return paths of all selected video files."""
         indices = list(self.file_listbox.curselection())
         paths = []
         for idx in indices:
@@ -433,12 +1287,14 @@ class SimMovieMaker:
     # ------------------------------------------------------------------
 
     def new_project(self):
+        self._stop_playback()
         self.project_file = None
         self.media_files = []
         self.selected_indices = []
         self.current_preview_index = 0
         self.file_listbox.delete(0, tk.END)
         self.update_preview()
+        self.thumb_strip.clear()
         self.video_info_label.config(text="")
         self.status_var.set("New project created")
 
@@ -449,14 +1305,11 @@ class SimMovieMaker:
         )
         if not filename:
             return
-
         try:
             with open(filename, "r") as f:
                 project_data = json.load(f)
 
             self.project_file = filename
-
-            # Handle both old format (list of strings) and new format (list of dicts)
             raw_files = project_data.get("media_files") or project_data.get("image_files", [])
             self.media_files = []
             for item in raw_files:
@@ -467,15 +1320,13 @@ class SimMovieMaker:
                     self.media_files.append(item)
 
             self.output_settings = project_data.get("output_settings", self.output_settings)
-
-            # Update UI
             self._refresh_listbox()
             self.fps_var.set(str(self.output_settings["fps"]))
             self.format_var.set(self.output_settings["format"])
             self.codec_var.set(self.output_settings["codec"])
-
             self.current_preview_index = 0
             self.update_preview()
+            self._rebuild_thumb_strip()
             self.status_var.set(f"Project loaded: {os.path.basename(filename)}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open project: {e}")
@@ -524,7 +1375,6 @@ class SimMovieMaker:
         )
         if not filenames:
             return
-
         existing_paths = {m["path"] for m in self.media_files}
         added = 0
         for fn in filenames:
@@ -533,16 +1383,15 @@ class SimMovieMaker:
                 self.media_files.append(entry)
                 self.file_listbox.insert(tk.END, _listbox_display(entry))
                 added += 1
-
         self.status_var.set(f"Added {added} image(s)")
         if self.media_files and self.current_preview_index == 0:
             self.update_preview()
+        self._rebuild_thumb_strip()
 
     def import_sequence(self):
         directory = filedialog.askdirectory(title="Select Directory with Image Sequence")
         if not directory:
             return
-
         pattern = simpledialog.askstring(
             "Image Sequence",
             "Enter filename pattern (e.g. 'frame_*.png' or use * as wildcard):",
@@ -551,20 +1400,14 @@ class SimMovieMaker:
         )
         if not pattern:
             return
-
         import re as _re
         regex_pattern = pattern.replace(".", r"\.").replace("*", ".*")
-
         files = sorted(os.listdir(directory))
         matching_files = [f for f in files if _re.match(regex_pattern, f)]
-
         if not matching_files:
-            messagebox.showinfo(
-                "No files found",
-                f"No files matching pattern '{pattern}' found in the selected directory.",
-            )
+            messagebox.showinfo("No files found",
+                                f"No files matching '{pattern}' in that directory.")
             return
-
         existing_paths = {m["path"] for m in self.media_files}
         added = 0
         for fn in matching_files:
@@ -574,10 +1417,10 @@ class SimMovieMaker:
                 self.media_files.append(entry)
                 self.file_listbox.insert(tk.END, _listbox_display(entry))
                 added += 1
-
         self.status_var.set(f"Added {added} file(s) from sequence")
         if self.media_files and self.current_preview_index == 0:
             self.update_preview()
+        self._rebuild_thumb_strip()
 
     def import_videos(self):
         filenames = filedialog.askopenfilenames(
@@ -589,7 +1432,6 @@ class SimMovieMaker:
         )
         if not filenames:
             return
-
         existing_paths = {m["path"] for m in self.media_files}
         added = 0
         for fn in filenames:
@@ -598,8 +1440,8 @@ class SimMovieMaker:
                 self.media_files.append(entry)
                 self.file_listbox.insert(tk.END, _listbox_display(entry))
                 added += 1
-
         self.status_var.set(f"Added {added} video(s)")
+        self._rebuild_thumb_strip()
 
     # ------------------------------------------------------------------
     # Edit menu
@@ -616,15 +1458,12 @@ class SimMovieMaker:
     def delete_selected(self):
         if not self.selected_indices:
             return
-
         indices = sorted(self.selected_indices, reverse=True)
         for idx in indices:
             if idx < len(self.media_files):
                 del self.media_files[idx]
             self.file_listbox.delete(idx)
-
         self.selected_indices = []
-
         if self.media_files:
             self.current_preview_index = min(self.current_preview_index,
                                              len(self.media_files) - 1)
@@ -632,35 +1471,27 @@ class SimMovieMaker:
         else:
             self.current_preview_index = 0
             self.preview_canvas.delete("all")
-            self.preview_label.config(text="0/0")
+        self._rebuild_thumb_strip()
 
     def move_selected(self, direction):
         if not self.selected_indices or len(self.selected_indices) != 1:
             return
-
         idx = self.selected_indices[0]
         target_idx = idx + direction
-
         if target_idx < 0 or target_idx >= len(self.media_files):
             return
-
-        # Swap
         self.media_files[idx], self.media_files[target_idx] = (
-            self.media_files[target_idx],
-            self.media_files[idx],
-        )
-
-        # Update listbox
+            self.media_files[target_idx], self.media_files[idx])
         self.file_listbox.delete(idx)
-        self.file_listbox.insert(target_idx, _listbox_display(self.media_files[target_idx]))
-
+        self.file_listbox.insert(target_idx,
+                                 _listbox_display(self.media_files[target_idx]))
         self.file_listbox.selection_clear(0, tk.END)
         self.file_listbox.selection_set(target_idx)
         self.selected_indices = [target_idx]
-
         if idx == self.current_preview_index:
             self.current_preview_index = target_idx
             self.update_preview()
+        self._rebuild_thumb_strip()
 
     # ------------------------------------------------------------------
     # Selection and preview
@@ -670,11 +1501,12 @@ class SimMovieMaker:
         self.update_selected_indices()
         if len(self.selected_indices) == 1:
             self.current_preview_index = self.selected_indices[0]
+            self._stop_playback()
             self.update_preview()
             self._show_selected_info()
+            self._rebuild_thumb_strip()
 
     def _show_selected_info(self):
-        """If a video is selected, display basic info below the preview."""
         if not self.selected_indices:
             self.video_info_label.config(text="")
             return
@@ -683,7 +1515,6 @@ class SimMovieMaker:
             return
         entry = self.media_files[idx]
         if entry["type"] == "video":
-            # Try to show video info (non-blocking)
             path = entry["path"]
             def _fetch():
                 try:
@@ -731,9 +1562,8 @@ class SimMovieMaker:
     def update_preview(self):
         if not self.media_files:
             self.preview_canvas.delete("all")
-            self.preview_label.config(text="0/0")
+            self._time_label.config(text="0:00 / 0:00")
             return
-
         if self.current_preview_index >= len(self.media_files):
             self.current_preview_index = len(self.media_files) - 1
 
@@ -745,96 +1575,67 @@ class SimMovieMaker:
         else:
             self._preview_image(path)
 
-        self.preview_label.config(
-            text=f"{self.current_preview_index + 1}/{len(self.media_files)}"
-        )
+        self._update_transport_display_images()
 
     def _preview_image(self, image_path):
         try:
             img = Image.open(image_path)
-
-            canvas_width = self.preview_canvas.winfo_width()
-            canvas_height = self.preview_canvas.winfo_height()
-
-            if canvas_width <= 1 or canvas_height <= 1:
+            canvas_w = self.preview_canvas.winfo_width()
+            canvas_h = self.preview_canvas.winfo_height()
+            if canvas_w <= 1 or canvas_h <= 1:
                 self.preview_canvas.after(100, self.update_preview)
                 return
-
-            img_width, img_height = img.size
-            scale = min(canvas_width / img_width, canvas_height / img_height)
-            new_width = int(img_width * scale)
-            new_height = int(img_height * scale)
-
-            img_resized = img.resize((new_width, new_height), Image.LANCZOS)
+            img_w, img_h = img.size
+            scale = min(canvas_w / img_w, canvas_h / img_h)
+            new_w = int(img_w * scale)
+            new_h = int(img_h * scale)
+            img_resized = img.resize((new_w, new_h), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img_resized)
             self.current_photo = photo
-
             self.preview_canvas.delete("all")
             self.preview_canvas.create_image(
-                canvas_width // 2, canvas_height // 2,
-                image=photo, anchor=tk.CENTER,
-            )
-
-            img_info = f"{os.path.basename(image_path)} - {img_width}x{img_height}"
-            self.status_var.set(img_info)
-
+                canvas_w // 2, canvas_h // 2,
+                image=photo, anchor=tk.CENTER)
+            self.status_var.set(
+                f"{os.path.basename(image_path)} - {img_w}x{img_h}")
         except Exception as e:
             self.preview_canvas.delete("all")
             self.preview_canvas.create_text(
                 self.preview_canvas.winfo_width() // 2,
                 self.preview_canvas.winfo_height() // 2,
-                text=f"Error loading image: {e}",
-                fill="white",
-            )
+                text=f"Error loading image: {e}", fill="white")
 
     def _preview_video_thumbnail(self, video_path):
-        """Extract the first frame from a video and show it in the preview canvas."""
         try:
             cap = cv2.VideoCapture(video_path)
             ret, frame = cap.read()
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             cap.release()
-
             if not ret or frame is None:
                 raise RuntimeError("Could not read first frame")
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(frame_rgb)
+            self._playback_fps = fps
+            self._playback_total_frames = total
+            self._playback_duration = total / fps if fps > 0 else 0
 
-            canvas_width = self.preview_canvas.winfo_width()
-            canvas_height = self.preview_canvas.winfo_height()
+            self._display_cv2_frame(frame)
 
-            if canvas_width <= 1 or canvas_height <= 1:
-                self.preview_canvas.after(100, self.update_preview)
-                return
-
-            img_width, img_height = img.size
-            scale = min(canvas_width / img_width, canvas_height / img_height)
-            new_width = int(img_width * scale)
-            new_height = int(img_height * scale)
-
-            img_resized = img.resize((new_width, new_height), Image.LANCZOS)
-            photo = ImageTk.PhotoImage(img_resized)
-            self.current_photo = photo
-
-            self.preview_canvas.delete("all")
-            self.preview_canvas.create_image(
-                canvas_width // 2, canvas_height // 2,
-                image=photo, anchor=tk.CENTER,
-            )
-
-            self.status_var.set(f"[VIDEO] {os.path.basename(video_path)} - {img_width}x{img_height}")
-
+            w = frame.shape[1]
+            h = frame.shape[0]
+            self.status_var.set(
+                f"[VIDEO] {os.path.basename(video_path)} - {w}x{h}")
+            self._time_label.config(
+                text=f"0:00 / {_format_time_short(self._playback_duration)}")
         except Exception as e:
             self.preview_canvas.delete("all")
             self.preview_canvas.create_text(
                 self.preview_canvas.winfo_width() // 2,
                 self.preview_canvas.winfo_height() // 2,
-                text=f"Error loading video thumbnail: {e}",
-                fill="white",
-            )
+                text=f"Error: {e}", fill="white")
 
     # ------------------------------------------------------------------
-    # Custom dialog helpers (icon-aware)
+    # Custom dialog helpers
     # ------------------------------------------------------------------
 
     def custom_askinteger(self, title, prompt, **kw):
@@ -853,7 +1654,6 @@ class SimMovieMaker:
             messagebox.showinfo("Preview", "Need at least 2 images to create a preview.")
             return
 
-        # FPS dialog
         fps_dialog = tk.Toplevel(self.root)
         fps_dialog.title("Preview FPS")
         fps_dialog.geometry("300x120")
@@ -863,15 +1663,14 @@ class SimMovieMaker:
 
         frame = ttk.Frame(fps_dialog, padding=15)
         frame.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(frame, text="Enter frames per second for preview:").pack(anchor=tk.W, pady=(0, 10))
-
+        ttk.Label(frame, text="Enter frames per second for preview:").pack(
+            anchor=tk.W, pady=(0, 10))
         fps_var = tk.IntVar(value=self.output_settings["fps"])
-        fps_spinbox = ttk.Spinbox(frame, from_=1, to=60, textvariable=fps_var, width=10)
+        fps_spinbox = ttk.Spinbox(frame, from_=1, to=60,
+                                  textvariable=fps_var, width=10)
         fps_spinbox.pack(anchor=tk.W, pady=(0, 10))
 
         preview_fps = [None]
-
         button_frame = ttk.Frame(frame)
         button_frame.pack(fill=tk.X)
 
@@ -882,23 +1681,19 @@ class SimMovieMaker:
                     preview_fps[0] = value
                     fps_dialog.destroy()
                 else:
-                    messagebox.showwarning("Invalid Input", "Value must be between 1 and 60.")
+                    messagebox.showwarning("Invalid", "Value must be 1-60.")
             except ValueError:
-                messagebox.showwarning("Invalid Input", "Please enter a valid number.")
-
-        def on_cancel():
-            fps_dialog.destroy()
+                messagebox.showwarning("Invalid", "Enter a valid number.")
 
         ttk.Button(button_frame, text="OK", command=on_ok).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=5)
-
+        ttk.Button(button_frame, text="Cancel",
+                   command=fps_dialog.destroy).pack(side=tk.RIGHT, padx=5)
         fps_spinbox.focus_set()
 
         fps_dialog.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width() - fps_dialog.winfo_width()) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - fps_dialog.winfo_height()) // 2
         fps_dialog.geometry(f"+{x}+{y}")
-
         self.root.wait_window(fps_dialog)
 
         chosen_fps = preview_fps[0]
@@ -907,18 +1702,17 @@ class SimMovieMaker:
 
         temp_output = os.path.join(os.path.expanduser("~"), "sim_preview_temp.mp4")
         preview_files = images[:min(100, len(images))]
-
-        progress = ProgressDialog(self.root, "Creating Preview", maximum=len(preview_files))
+        progress = ProgressDialog(self.root, "Creating Preview",
+                                  maximum=len(preview_files))
 
         def _thread():
             try:
                 first_img = cv2.imread(preview_files[0])
                 if first_img is None:
-                    raise RuntimeError(f"Cannot read image: {preview_files[0]}")
+                    raise RuntimeError(f"Cannot read: {preview_files[0]}")
                 height, width = first_img.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 out = cv2.VideoWriter(temp_output, fourcc, chosen_fps, (width, height))
-
                 for i, img_path in enumerate(preview_files):
                     if progress.cancelled:
                         out.release()
@@ -928,14 +1722,13 @@ class SimMovieMaker:
                     img = cv2.imread(img_path)
                     if img is not None:
                         out.write(img)
-
                 out.release()
                 self.root.after(0, progress.destroy)
                 self.play_output_file(temp_output)
-
             except Exception as e:
                 self.root.after(0, progress.destroy)
-                self.root.after(0, messagebox.showerror, "Error", f"Failed to create preview: {e}")
+                self.root.after(0, messagebox.showerror, "Error",
+                                f"Failed to create preview: {e}")
 
         threading.Thread(target=_thread, daemon=True).start()
 
@@ -955,19 +1748,25 @@ class SimMovieMaker:
 
         ttk.Label(frame, text="Frames Per Second:").grid(row=0, column=0, sticky=tk.W, pady=5)
         fps_var = tk.StringVar(value=str(self.output_settings["fps"]))
-        ttk.Spinbox(frame, from_=1, to=120, textvariable=fps_var, width=10).grid(row=0, column=1, sticky=tk.W, pady=5)
+        ttk.Spinbox(frame, from_=1, to=120, textvariable=fps_var, width=10).grid(
+            row=0, column=1, sticky=tk.W, pady=5)
 
         ttk.Label(frame, text="Output Format:").grid(row=1, column=0, sticky=tk.W, pady=5)
         format_var = tk.StringVar(value=self.output_settings["format"])
-        ttk.Combobox(frame, textvariable=format_var, values=["mp4", "avi", "mov", "webm"], width=10).grid(row=1, column=1, sticky=tk.W, pady=5)
+        ttk.Combobox(frame, textvariable=format_var,
+                     values=["mp4", "avi", "mov", "webm"], width=10).grid(
+            row=1, column=1, sticky=tk.W, pady=5)
 
         ttk.Label(frame, text="Video Codec:").grid(row=2, column=0, sticky=tk.W, pady=5)
         codec_var = tk.StringVar(value=self.output_settings["codec"])
-        ttk.Combobox(frame, textvariable=codec_var, values=["H264", "MJPG", "XVID", "VP9"], width=10).grid(row=2, column=1, sticky=tk.W, pady=5)
+        ttk.Combobox(frame, textvariable=codec_var,
+                     values=["H264", "MJPG", "XVID", "VP9"], width=10).grid(
+            row=2, column=1, sticky=tk.W, pady=5)
 
         ttk.Label(frame, text="Quality (0-100):").grid(row=3, column=0, sticky=tk.W, pady=5)
         quality_var = tk.StringVar(value=str(self.output_settings["quality"]))
-        ttk.Spinbox(frame, from_=0, to=100, textvariable=quality_var, width=10).grid(row=3, column=1, sticky=tk.W, pady=5)
+        ttk.Spinbox(frame, from_=0, to=100, textvariable=quality_var, width=10).grid(
+            row=3, column=1, sticky=tk.W, pady=5)
 
         button_frame = ttk.Frame(frame)
         button_frame.grid(row=4, column=0, columnspan=2, pady=20)
@@ -986,16 +1785,17 @@ class SimMovieMaker:
                 messagebox.showerror("Error", f"Invalid value: {e}")
 
         ttk.Button(button_frame, text="Save", command=save_settings).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Cancel", command=settings.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Cancel",
+                   command=settings.destroy).pack(side=tk.LEFT, padx=5)
 
     # ------------------------------------------------------------------
-    # Create video from images (original workflow)
+    # Create video from images
     # ------------------------------------------------------------------
 
     def create_video(self):
         images = self.image_files
         if len(images) < 2:
-            messagebox.showinfo("Create Video", "Need at least 2 images to create a video.")
+            messagebox.showinfo("Create Video", "Need at least 2 images.")
             return
 
         output_file = filedialog.asksaveasfilename(
@@ -1016,7 +1816,7 @@ class SimMovieMaker:
             try:
                 first_img = cv2.imread(images[0])
                 if first_img is None:
-                    raise RuntimeError(f"Cannot read image: {images[0]}")
+                    raise RuntimeError(f"Cannot read: {images[0]}")
                 height, width = first_img.shape[:2]
 
                 fmt = self.output_settings["format"]
@@ -1031,9 +1831,8 @@ class SimMovieMaker:
                 else:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-                out = cv2.VideoWriter(
-                    output_file, fourcc, self.output_settings["fps"], (width, height))
-
+                out = cv2.VideoWriter(output_file, fourcc,
+                                      self.output_settings["fps"], (width, height))
                 for i, img_path in enumerate(images):
                     if progress.cancelled:
                         out.release()
@@ -1043,20 +1842,17 @@ class SimMovieMaker:
                     img = cv2.imread(img_path)
                     if img is not None:
                         out.write(img)
-
                 out.release()
                 self.root.after(0, progress.destroy)
-
                 play = messagebox.askyesno(
                     "Success",
-                    f"Video created successfully at:\n{output_file}\n\nPlay it now?",
-                )
+                    f"Video created at:\n{output_file}\n\nPlay it now?")
                 if play:
                     self.play_output_file(output_file)
-
             except Exception as e:
                 self.root.after(0, progress.destroy)
-                self.root.after(0, messagebox.showerror, "Error", f"Failed to create video: {e}")
+                self.root.after(0, messagebox.showerror, "Error",
+                                f"Failed to create video: {e}")
 
         threading.Thread(target=_thread, daemon=True).start()
 
@@ -1094,14 +1890,10 @@ class SimMovieMaker:
     # ==================================================================
 
     def _run_video_op(self, title, operation_fn, done_msg=None):
-        """Generic helper: run *operation_fn* in a background thread with a
-        ProgressDialog.  *operation_fn* receives a progress_callback that
-        accepts a float 0-100.  Returns via root.after on completion."""
         progress = ProgressDialog(self.root, title, maximum=100)
 
         def _cb(pct):
-            self.root.after(0, progress.update_progress, pct,
-                            f"{pct:.0f}%")
+            self.root.after(0, progress.update_progress, pct, f"{pct:.0f}%")
 
         def _thread():
             try:
@@ -1120,16 +1912,15 @@ class SimMovieMaker:
 
         threading.Thread(target=_thread, daemon=True).start()
 
-    # -- Merge Videos --------------------------------------------------
+    # -- Merge Videos --
 
     def merge_videos(self):
         if not self._require_ffmpeg():
             return
-
         paths = self._get_selected_video_paths()
         if len(paths) < 2:
             messagebox.showinfo("Merge Videos",
-                                "Select at least 2 video files in the list to merge.")
+                                "Select at least 2 video files to merge.")
             return
 
         dlg = MergeOptionsDialog(self.root)
@@ -1149,10 +1940,9 @@ class SimMovieMaker:
         def op(cb):
             video_ops.merge_videos(paths, output_file, progress_callback=cb)
             return f"Merged video saved to:\n{output_file}"
-
         self._run_video_op("Merging Videos", op)
 
-    # -- Split Video ---------------------------------------------------
+    # -- Split Video --
 
     def split_video(self):
         if not self._require_ffmpeg():
@@ -1161,7 +1951,6 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("Split Video", "Select a video file first.")
             return
-
         try:
             info = video_ops.get_video_info(path)
         except Exception as e:
@@ -1173,20 +1962,18 @@ class SimMovieMaker:
         if dlg.result is None or not dlg.result:
             return
 
-        output_dir = filedialog.askdirectory(title="Select Output Directory for Segments")
+        output_dir = filedialog.askdirectory(title="Select Output Directory")
         if not output_dir:
             return
-
         split_points = dlg.result
 
         def op(cb):
             result_files = video_ops.split_video(path, output_dir, split_points,
                                                  progress_callback=cb)
             return f"Split into {len(result_files)} segment(s) in:\n{output_dir}"
-
         self._run_video_op("Splitting Video", op)
 
-    # -- Trim Video ----------------------------------------------------
+    # -- Trim Video --
 
     def trim_video(self):
         if not self._require_ffmpeg():
@@ -1195,7 +1982,6 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("Trim Video", "Select a video file first.")
             return
-
         try:
             info = video_ops.get_video_info(path)
         except Exception as e:
@@ -1213,8 +1999,7 @@ class SimMovieMaker:
 
         output_file = filedialog.asksaveasfilename(
             title="Save Trimmed Video As",
-            initialfile=default_name,
-            defaultextension=ext,
+            initialfile=default_name, defaultextension=ext,
             filetypes=[("Video files", f"*{ext}"), ("All files", "*.*")],
         )
         if not output_file:
@@ -1224,10 +2009,9 @@ class SimMovieMaker:
             video_ops.trim_video(path, output_file, start_time, end_time,
                                  progress_callback=cb)
             return f"Trimmed video saved to:\n{output_file}"
-
         self._run_video_op("Trimming Video", op)
 
-    # -- Mute Audio ----------------------------------------------------
+    # -- Mute Audio --
 
     def mute_audio(self):
         if not self._require_ffmpeg():
@@ -1236,14 +2020,11 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("Mute Audio", "Select a video file first.")
             return
-
         base, ext = os.path.splitext(path)
         default_name = f"{os.path.basename(base)}_muted{ext}"
-
         output_file = filedialog.asksaveasfilename(
             title="Save Muted Video As",
-            initialfile=default_name,
-            defaultextension=ext,
+            initialfile=default_name, defaultextension=ext,
             filetypes=[("Video files", f"*{ext}"), ("All files", "*.*")],
         )
         if not output_file:
@@ -1252,10 +2033,9 @@ class SimMovieMaker:
         def op(cb):
             video_ops.mute_audio(path, output_file, progress_callback=cb)
             return f"Audio removed. Saved to:\n{output_file}"
-
         self._run_video_op("Removing Audio", op)
 
-    # -- Extract Audio -------------------------------------------------
+    # -- Extract Audio --
 
     def extract_audio(self):
         if not self._require_ffmpeg():
@@ -1264,14 +2044,12 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("Extract Audio", "Select a video file first.")
             return
-
         base = os.path.splitext(os.path.basename(path))[0]
         output_file = filedialog.asksaveasfilename(
             title="Save Audio As",
-            initialfile=f"{base}_audio.aac",
-            defaultextension=".aac",
-            filetypes=[("AAC audio", "*.aac"), ("MP3 audio", "*.mp3"),
-                       ("WAV audio", "*.wav"), ("All files", "*.*")],
+            initialfile=f"{base}_audio.aac", defaultextension=".aac",
+            filetypes=[("AAC", "*.aac"), ("MP3", "*.mp3"),
+                       ("WAV", "*.wav"), ("All files", "*.*")],
         )
         if not output_file:
             return
@@ -1279,10 +2057,9 @@ class SimMovieMaker:
         def op(cb):
             video_ops.extract_audio(path, output_file, progress_callback=cb)
             return f"Audio extracted to:\n{output_file}"
-
         self._run_video_op("Extracting Audio", op)
 
-    # -- Add Audio -----------------------------------------------------
+    # -- Add Audio --
 
     def add_audio(self):
         if not self._require_ffmpeg():
@@ -1291,7 +2068,6 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("Add Audio", "Select a video file first.")
             return
-
         audio_file = filedialog.askopenfilename(
             title="Select Audio File",
             filetypes=[("Audio files", "*.mp3 *.aac *.wav *.ogg *.flac *.m4a"),
@@ -1299,34 +2075,26 @@ class SimMovieMaker:
         )
         if not audio_file:
             return
-
         replace = messagebox.askyesno(
             "Replace Audio?",
-            "Replace existing audio track?\n\n"
-            "Yes = replace original audio\n"
-            "No = add as additional audio stream",
-        )
-
+            "Yes = replace original audio\nNo = add as additional stream")
         base, ext = os.path.splitext(path)
         default_name = f"{os.path.basename(base)}_with_audio{ext}"
-
         output_file = filedialog.asksaveasfilename(
             title="Save Video With Audio As",
-            initialfile=default_name,
-            defaultextension=ext,
+            initialfile=default_name, defaultextension=ext,
             filetypes=[("Video files", f"*{ext}"), ("All files", "*.*")],
         )
         if not output_file:
             return
 
         def op(cb):
-            video_ops.add_audio(path, audio_file, output_file, replace=replace,
-                                progress_callback=cb)
+            video_ops.add_audio(path, audio_file, output_file,
+                                replace=replace, progress_callback=cb)
             return f"Audio added. Saved to:\n{output_file}"
-
         self._run_video_op("Adding Audio", op)
 
-    # -- Change Speed --------------------------------------------------
+    # -- Change Speed --
 
     def change_speed(self):
         if not self._require_ffmpeg():
@@ -1335,21 +2103,16 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("Change Speed", "Select a video file first.")
             return
-
         dlg = SpeedDialog(self.root)
         self.root.wait_window(dlg)
         if dlg.result is None:
             return
-
         speed_factor = dlg.result
-
         base, ext = os.path.splitext(path)
         default_name = f"{os.path.basename(base)}_{speed_factor}x{ext}"
-
         output_file = filedialog.asksaveasfilename(
             title="Save Speed-Changed Video As",
-            initialfile=default_name,
-            defaultextension=ext,
+            initialfile=default_name, defaultextension=ext,
             filetypes=[("Video files", f"*{ext}"), ("All files", "*.*")],
         )
         if not output_file:
@@ -1359,10 +2122,9 @@ class SimMovieMaker:
             video_ops.change_speed(path, output_file, speed_factor,
                                    progress_callback=cb)
             return f"Speed changed ({speed_factor}x). Saved to:\n{output_file}"
-
         self._run_video_op("Changing Speed", op)
 
-    # -- Extract Frames ------------------------------------------------
+    # -- Extract Frames --
 
     def extract_frames(self):
         if not self._require_ffmpeg():
@@ -1371,7 +2133,6 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("Extract Frames", "Select a video file first.")
             return
-
         try:
             info = video_ops.get_video_info(path)
         except Exception as e:
@@ -1384,11 +2145,10 @@ class SimMovieMaker:
             return
 
         settings = dlg.result
-        output_dir = filedialog.askdirectory(title="Select Output Directory for Frames")
+        output_dir = filedialog.askdirectory(title="Select Output Directory")
         if not output_dir:
             return
 
-        # Determine fps arg for extract_frames
         extract_fps = None
         if settings["mode"] == "fps":
             extract_fps = settings.get("fps")
@@ -1396,18 +2156,14 @@ class SimMovieMaker:
             nth = settings.get("nth", 10)
             if info["fps"] > 0:
                 extract_fps = info["fps"] / nth
-
         fmt = settings.get("format", "png").lower()
 
         def op(cb):
             result_files = video_ops.extract_frames(
                 path, output_dir, fps=extract_fps, format=fmt,
-                progress_callback=cb,
-            )
-            # Optionally add extracted frames to the media list
+                progress_callback=cb)
             self.root.after(0, self._offer_add_extracted_frames, result_files)
             return f"Extracted {len(result_files)} frame(s) to:\n{output_dir}"
-
         self._run_video_op("Extracting Frames", op)
 
     def _offer_add_extracted_frames(self, frame_paths):
@@ -1415,19 +2171,18 @@ class SimMovieMaker:
             return
         add = messagebox.askyesno(
             "Add Frames?",
-            f"Extracted {len(frame_paths)} frames.\n\n"
-            "Add them to the media file list?",
-        )
+            f"Extracted {len(frame_paths)} frames.\nAdd to the media list?")
         if add:
-            existing_paths = {m["path"] for m in self.media_files}
+            existing = {m["path"] for m in self.media_files}
             for fp in frame_paths:
-                if fp not in existing_paths:
+                if fp not in existing:
                     entry = {"path": fp, "type": "image"}
                     self.media_files.append(entry)
                     self.file_listbox.insert(tk.END, _listbox_display(entry))
+            self._rebuild_thumb_strip()
             self.status_var.set(f"Added {len(frame_paths)} extracted frames")
 
-    # -- Convert Format ------------------------------------------------
+    # -- Convert Format --
 
     def convert_format(self):
         if not self._require_ffmpeg():
@@ -1436,15 +2191,11 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("Convert Format", "Select a video file first.")
             return
-
         base = os.path.splitext(os.path.basename(path))[0]
         output_file = filedialog.asksaveasfilename(
-            title="Save Converted Video As",
-            initialfile=base,
-            filetypes=[
-                ("MP4", "*.mp4"), ("MKV", "*.mkv"), ("AVI", "*.avi"),
-                ("MOV", "*.mov"), ("WebM", "*.webm"), ("All files", "*.*"),
-            ],
+            title="Save Converted Video As", initialfile=base,
+            filetypes=[("MP4", "*.mp4"), ("MKV", "*.mkv"), ("AVI", "*.avi"),
+                       ("MOV", "*.mov"), ("WebM", "*.webm"), ("All", "*.*")],
         )
         if not output_file:
             return
@@ -1452,10 +2203,9 @@ class SimMovieMaker:
         def op(cb):
             video_ops.convert_format(path, output_file, progress_callback=cb)
             return f"Converted video saved to:\n{output_file}"
-
         self._run_video_op("Converting Video", op)
 
-    # -- Create GIF ----------------------------------------------------
+    # -- Create GIF --
 
     def create_gif(self):
         if not self._require_ffmpeg():
@@ -1464,23 +2214,19 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("Create GIF", "Select a video file first.")
             return
-
-        fps = simpledialog.askinteger("GIF FPS", "Frames per second for the GIF:",
+        fps = simpledialog.askinteger("GIF FPS", "Frames per second:",
                                       initialvalue=10, minvalue=1, maxvalue=30,
                                       parent=self.root)
         if fps is None:
             return
-
-        width = simpledialog.askinteger("GIF Width", "Width in pixels (height auto):",
-                                        initialvalue=480, minvalue=100, maxvalue=3840,
-                                        parent=self.root)
+        width = simpledialog.askinteger("GIF Width", "Width in pixels:",
+                                        initialvalue=480, minvalue=100,
+                                        maxvalue=3840, parent=self.root)
         if width is None:
             return
-
         base = os.path.splitext(os.path.basename(path))[0]
         output_file = filedialog.asksaveasfilename(
-            title="Save GIF As",
-            initialfile=f"{base}.gif",
+            title="Save GIF As", initialfile=f"{base}.gif",
             defaultextension=".gif",
             filetypes=[("GIF files", "*.gif"), ("All files", "*.*")],
         )
@@ -1491,7 +2237,6 @@ class SimMovieMaker:
             video_ops.create_gif(path, output_file, fps=fps, width=width,
                                  progress_callback=cb)
             return f"GIF created at:\n{output_file}"
-
         self._run_video_op("Creating GIF", op)
 
     # ==================================================================
@@ -1505,14 +2250,11 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("View Metadata", "Select a video file first.")
             return
-
         try:
             info = video_ops.get_video_info(path)
         except Exception as e:
             messagebox.showerror("Error", f"Could not read video info: {e}")
             return
-
-        # Build a friendly info dict for the dialog
         display = {
             "duration": format_duration(info["duration"]),
             "resolution": f"{info['width']}x{info['height']}",
@@ -1531,7 +2273,6 @@ class SimMovieMaker:
         if not path:
             messagebox.showinfo("Edit Metadata", "Select a video file first.")
             return
-
         try:
             existing = video_ops.get_metadata(path)
         except Exception as e:
@@ -1544,14 +2285,11 @@ class SimMovieMaker:
             return
 
         new_meta = dlg.result
-
         base, ext = os.path.splitext(path)
         default_name = f"{os.path.basename(base)}_meta{ext}"
-
         output_file = filedialog.asksaveasfilename(
             title="Save Video With Updated Metadata",
-            initialfile=default_name,
-            defaultextension=ext,
+            initialfile=default_name, defaultextension=ext,
             filetypes=[("Video files", f"*{ext}"), ("All files", "*.*")],
         )
         if not output_file:
@@ -1561,24 +2299,22 @@ class SimMovieMaker:
             video_ops.set_metadata(path, output_file, new_meta,
                                    progress_callback=cb)
             return f"Metadata updated. Saved to:\n{output_file}"
-
         self._run_video_op("Writing Metadata", op)
 
     def strip_metadata(self):
+        """Fast metadata strip (stream copy, removes global/stream/chapter metadata
+        plus owner, computer, GPS, EXIF, XMP info using bitexact flags)."""
         if not self._require_ffmpeg():
             return
         path = self._get_selected_video_path()
         if not path:
             messagebox.showinfo("Strip Metadata", "Select a video file first.")
             return
-
         base, ext = os.path.splitext(path)
         default_name = f"{os.path.basename(base)}_stripped{ext}"
-
         output_file = filedialog.asksaveasfilename(
             title="Save Stripped Video As",
-            initialfile=default_name,
-            defaultextension=ext,
+            initialfile=default_name, defaultextension=ext,
             filetypes=[("Video files", f"*{ext}"), ("All files", "*.*")],
         )
         if not output_file:
@@ -1586,9 +2322,52 @@ class SimMovieMaker:
 
         def op(cb):
             video_ops.strip_metadata(path, output_file, progress_callback=cb)
-            return f"Metadata stripped. Saved to:\n{output_file}"
-
+            return (f"Metadata stripped (fast mode).\n"
+                    f"Removed: global, stream, chapter metadata + encoder info.\n"
+                    f"Saved to:\n{output_file}")
         self._run_video_op("Stripping Metadata", op)
+
+    def strip_metadata_deep(self):
+        """Deep metadata strip - re-encodes to guarantee complete removal of ALL
+        metadata including owner info, computer name, GPS, EXIF, XMP, and any
+        container-specific tags."""
+        if not self._require_ffmpeg():
+            return
+        path = self._get_selected_video_path()
+        if not path:
+            messagebox.showinfo("Strip Metadata (Deep)", "Select a video file first.")
+            return
+
+        if not messagebox.askyesno(
+            "Deep Metadata Strip",
+            "Deep strip re-encodes the video to guarantee complete removal of ALL "
+            "metadata including:\n\n"
+            "- Owner / author information\n"
+            "- Computer name / hostname\n"
+            "- GPS / location data\n"
+            "- EXIF / XMP / ID3 tags\n"
+            "- Encoder and creation tool info\n"
+            "- Chapter metadata\n\n"
+            "This is slower than fast strip but guarantees nothing survives.\n\n"
+            "Continue?"):
+            return
+
+        base, ext = os.path.splitext(path)
+        default_name = f"{os.path.basename(base)}_deep_stripped{ext}"
+        output_file = filedialog.asksaveasfilename(
+            title="Save Deep-Stripped Video As",
+            initialfile=default_name, defaultextension=ext,
+            filetypes=[("Video files", f"*{ext}"), ("All files", "*.*")],
+        )
+        if not output_file:
+            return
+
+        def op(cb):
+            video_ops.strip_metadata_deep(path, output_file, progress_callback=cb)
+            return (f"Deep metadata strip complete.\n"
+                    f"All metadata removed (re-encoded).\n"
+                    f"Saved to:\n{output_file}")
+        self._run_video_op("Deep Stripping Metadata", op)
 
     @staticmethod
     def _format_file_size(size_bytes):
@@ -1608,7 +2387,6 @@ class SimMovieMaker:
         if not self.selected_indices:
             messagebox.showinfo("Filter", "Please select images to apply the filter to.")
             return
-
         dispatch = {
             "crop": self.show_crop_dialog,
             "resize": self.show_resize_dialog,
@@ -1625,7 +2403,6 @@ class SimMovieMaker:
             handler()
 
     def _get_selected_image_paths(self):
-        """Return the paths of all selected image entries."""
         return [
             self.media_files[i]["path"]
             for i in self.selected_indices
@@ -1633,13 +2410,10 @@ class SimMovieMaker:
         ]
 
     def _apply_cv2_filter_to_selected(self, filter_fn, description="filter"):
-        """Apply *filter_fn(img) -> img* to every selected image and
-        overwrite the file.  Shows a progress bar."""
         paths = self._get_selected_image_paths()
         if not paths:
             messagebox.showinfo("Filter", "No images selected.")
             return
-
         progress = ProgressDialog(self.root, f"Applying {description}",
                                   maximum=len(paths))
 
@@ -1665,7 +2439,7 @@ class SimMovieMaker:
 
         threading.Thread(target=_thread, daemon=True).start()
 
-    # -- Crop dialog ---------------------------------------------------
+    # -- Crop dialog --
 
     def show_crop_dialog(self):
         crop = tk.Toplevel(self.root)
@@ -1711,7 +2485,7 @@ class SimMovieMaker:
         ttk.Button(button_frame, text="Apply", command=apply_crop).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Cancel", command=crop.destroy).pack(side=tk.LEFT, padx=5)
 
-    # -- Resize dialog -------------------------------------------------
+    # -- Resize dialog --
 
     def show_resize_dialog(self):
         dlg = tk.Toplevel(self.root)
@@ -1742,16 +2516,16 @@ class SimMovieMaker:
                     raise ValueError("Dimensions must be positive")
                 dlg.destroy()
                 self._apply_cv2_filter_to_selected(
-                    lambda img: cv2.resize(img, (w, h), interpolation=cv2.INTER_LANCZOS4),
-                    "Resize",
-                )
+                    lambda img: cv2.resize(img, (w, h),
+                                           interpolation=cv2.INTER_LANCZOS4),
+                    "Resize")
             except ValueError as e:
                 messagebox.showerror("Error", f"Invalid value: {e}")
 
         ttk.Button(btn_frame, text="Apply", command=apply_resize).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT, padx=5)
 
-    # -- Rotate dialog -------------------------------------------------
+    # -- Rotate dialog --
 
     def show_rotate_dialog(self):
         dlg = tk.Toplevel(self.root)
@@ -1796,7 +2570,7 @@ class SimMovieMaker:
         ttk.Button(btn_frame, text="Apply", command=apply_rotate).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT, padx=5)
 
-    # -- Brightness dialog ---------------------------------------------
+    # -- Brightness dialog --
 
     def show_brightness_dialog(self):
         dlg = tk.Toplevel(self.root)
@@ -1813,7 +2587,6 @@ class SimMovieMaker:
         scale = ttk.Scale(frame, from_=-255, to=255, orient=tk.HORIZONTAL,
                           variable=bright_var)
         scale.pack(fill=tk.X, pady=5)
-
         val_label = ttk.Label(frame, text="0")
         val_label.pack(anchor=tk.E)
         scale.config(command=lambda v: val_label.config(text=f"{int(float(v))}"))
@@ -1826,13 +2599,14 @@ class SimMovieMaker:
             dlg.destroy()
             self._apply_cv2_filter_to_selected(
                 lambda img: cv2.convertScaleAbs(img, alpha=1.0, beta=offset),
-                "Brightness",
-            )
+                "Brightness")
 
-        ttk.Button(btn_frame, text="Apply", command=apply_brightness).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Apply",
+                   command=apply_brightness).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Cancel",
+                   command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
 
-    # -- Contrast dialog -----------------------------------------------
+    # -- Contrast dialog --
 
     def show_contrast_dialog(self):
         dlg = tk.Toplevel(self.root)
@@ -1849,7 +2623,6 @@ class SimMovieMaker:
         scale = ttk.Scale(frame, from_=0.1, to=3.0, orient=tk.HORIZONTAL,
                           variable=contrast_var)
         scale.pack(fill=tk.X, pady=5)
-
         val_label = ttk.Label(frame, text="1.00")
         val_label.pack(anchor=tk.E)
         scale.config(command=lambda v: val_label.config(text=f"{float(v):.2f}"))
@@ -1862,22 +2635,22 @@ class SimMovieMaker:
             dlg.destroy()
             self._apply_cv2_filter_to_selected(
                 lambda img: cv2.convertScaleAbs(img, alpha=factor, beta=0),
-                "Contrast",
-            )
+                "Contrast")
 
-        ttk.Button(btn_frame, text="Apply", command=apply_contrast).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Apply",
+                   command=apply_contrast).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Cancel",
+                   command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
 
-    # -- Grayscale -----------------------------------------------------
+    # -- Grayscale --
 
     def apply_grayscale(self):
         def _to_gray(img):
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
         self._apply_cv2_filter_to_selected(_to_gray, "Grayscale")
 
-    # -- Text overlay dialog -------------------------------------------
+    # -- Text overlay dialog --
 
     def show_text_overlay_dialog(self):
         dlg = tk.Toplevel(self.root)
@@ -1922,11 +2695,9 @@ class SimMovieMaker:
                 dlg.destroy()
 
                 def _overlay(img):
-                    return cv2.putText(
-                        img.copy(), text, (x, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, fs, color, 2, cv2.LINE_AA,
-                    )
-
+                    return cv2.putText(img.copy(), text, (x, y),
+                                       cv2.FONT_HERSHEY_SIMPLEX, fs, color, 2,
+                                       cv2.LINE_AA)
                 self._apply_cv2_filter_to_selected(_overlay, "Text Overlay")
             except Exception as e:
                 messagebox.showerror("Error", f"Invalid input: {e}")
@@ -1934,7 +2705,7 @@ class SimMovieMaker:
         ttk.Button(btn_frame, text="Apply", command=apply_text).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT, padx=5)
 
-    # -- Scale bar dialog ----------------------------------------------
+    # -- Scale bar dialog --
 
     def show_scale_bar_dialog(self):
         dlg = tk.Toplevel(self.root)
@@ -1980,14 +2751,11 @@ class SimMovieMaker:
 
                 def _bar(img):
                     out = img.copy()
-                    # Draw the bar line
                     cv2.line(out, (x, y), (x + bar_len, y), (255, 255, 255), thickness)
-                    # End caps
                     cap_h = thickness * 2
                     cv2.line(out, (x, y - cap_h), (x, y + cap_h), (255, 255, 255), thickness)
                     cv2.line(out, (x + bar_len, y - cap_h), (x + bar_len, y + cap_h),
                              (255, 255, 255), thickness)
-                    # Label
                     cv2.putText(out, label, (x, y - cap_h - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
                                 cv2.LINE_AA)
@@ -2000,7 +2768,7 @@ class SimMovieMaker:
         ttk.Button(btn_frame, text="Apply", command=apply_scale_bar).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT, padx=5)
 
-    # -- Timestamp dialog ----------------------------------------------
+    # -- Timestamp dialog --
 
     def show_timestamp_dialog(self):
         dlg = tk.Toplevel(self.root)
@@ -2095,14 +2863,16 @@ class SimMovieMaker:
         frame = ttk.Frame(batch, padding=15)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frame, text="Batch Processing", font=("TkDefaultFont", 11, "bold")).pack(
+        ttk.Label(frame, text="Batch Processing",
+                  font=("TkDefaultFont", 11, "bold")).pack(anchor=tk.W, pady=(0, 10))
+        ttk.Label(frame, text="Apply a filter to all images in the list.").pack(
             anchor=tk.W, pady=(0, 10))
-        ttk.Label(frame, text="Apply a filter to all images in the list.").pack(anchor=tk.W, pady=(0, 10))
 
         filter_var = tk.StringVar(value="grayscale")
         filters = ["grayscale", "resize", "rotate", "brightness", "contrast"]
         ttk.Label(frame, text="Select filter:").pack(anchor=tk.W)
-        combo = ttk.Combobox(frame, textvariable=filter_var, values=filters, state="readonly", width=20)
+        combo = ttk.Combobox(frame, textvariable=filter_var, values=filters,
+                             state="readonly", width=20)
         combo.pack(anchor=tk.W, pady=5)
 
         btn_frame = ttk.Frame(frame)
@@ -2110,64 +2880,55 @@ class SimMovieMaker:
 
         def run_batch():
             batch.destroy()
-            # Select all items then apply the chosen filter
             self.file_listbox.selection_set(0, tk.END)
             self.update_selected_indices()
             self.apply_filter(filter_var.get())
 
         ttk.Button(btn_frame, text="Run", command=run_batch).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=batch.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel",
+                   command=batch.destroy).pack(side=tk.LEFT, padx=5)
 
     def export_file_list(self):
         if not self.media_files:
             messagebox.showinfo("Export List", "No files to export.")
             return
-
         filename = filedialog.asksaveasfilename(
-            title="Export File List",
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-        )
+            title="Export File List", defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
         if not filename:
             return
-
         try:
             with open(filename, "w") as f:
                 for entry in self.media_files:
                     f.write(f"{entry['path']}\n")
             self.status_var.set(f"File list exported to {os.path.basename(filename)}")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export file list: {e}")
+            messagebox.showerror("Error", f"Failed to export: {e}")
 
     def import_file_list(self):
         filename = filedialog.askopenfilename(
             title="Import File List",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-        )
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
         if not filename:
             return
-
         try:
             with open(filename, "r") as f:
                 file_paths = [line.strip() for line in f if line.strip()]
-
             self.media_files = []
             self.file_listbox.delete(0, tk.END)
-
             for path in file_paths:
                 if os.path.isfile(path):
                     mtype = "video" if _is_video_file(path) else "image"
                     entry = {"path": path, "type": mtype}
                     self.media_files.append(entry)
                     self.file_listbox.insert(tk.END, _listbox_display(entry))
-
             if self.media_files:
                 self.current_preview_index = 0
                 self.update_preview()
-
-            self.status_var.set(f"Imported {len(self.media_files)} file(s) from list")
+            self._rebuild_thumb_strip()
+            self.status_var.set(f"Imported {len(self.media_files)} file(s)")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to import file list: {e}")
+            messagebox.showerror("Error", f"Failed to import: {e}")
 
     # ==================================================================
     # HELP
@@ -2197,7 +2958,7 @@ IMAGE WORKFLOW
    or File > Import Sequence.
 2. Arrange images in the desired order using the Up/Down buttons.
 3. Set output properties (FPS, format, codec).
-4. Use Preview to check how the movie will look.
+4. Use the Play button or Preview to check how the movie will look.
 5. Click Create Video to generate the final output.
 
 VIDEO OPERATIONS (requires FFmpeg)
@@ -2206,6 +2967,7 @@ VIDEO OPERATIONS (requires FFmpeg)
 - Split Video: split a video at defined time points.
 - Trim Video: remove start/end portions.
 - Audio operations: mute, extract, or add audio tracks.
+- Mute Section: mute audio in a specific time range.
 - Change Speed: speed up or slow down playback.
 - Extract Frames: pull individual frames as images.
 - Convert Format: transcode between video formats.
@@ -2214,12 +2976,27 @@ VIDEO OPERATIONS (requires FFmpeg)
 METADATA
 --------
 - View, edit, or strip metadata from video files.
+- Strip Metadata (Fast): removes all metadata using stream copy.
+- Strip Metadata (Deep): re-encodes to guarantee complete removal
+  of ALL metadata including owner info, computer name, GPS, EXIF,
+  XMP, ID3 tags, encoder info, and chapter metadata.
 
-FILTERS
--------
-- Crop, Resize, Rotate
-- Brightness, Contrast, Grayscale
-- Text Overlay, Scale Bar, Timestamp
+TRANSPORT CONTROLS
+------------------
+- Play/Pause: play images as slideshow or video files frame by frame.
+- Stop: stop and reset to beginning.
+- << / >>: jump to first/last frame.
+- < / >: step one frame backward/forward.
+- Position slider: seek to any position.
+- Crop Region: draw a rectangle on preview to crop.
+- Trim Section / Mute Section: quick access to trim/mute tools.
+
+THUMBNAIL STRIP
+---------------
+- Shows thumbnails of all media files or video frames.
+- Click a thumbnail to jump to that position.
+- Scroll horizontally with mouse wheel.
+- Thumbnails load in the background for performance.
 
 KEYBOARD SHORTCUTS
 ------------------
@@ -2246,17 +3023,13 @@ KEYBOARD SHORTCUTS
                 f"FFmpeg is available.\n\n"
                 f"ffmpeg:  {status['ffmpeg_path']}\n"
                 f"ffprobe: {status['ffprobe_path']}\n\n"
-                f"Version: {status['version']}"
-            )
+                f"Version: {status['version']}")
         else:
             text = "FFmpeg was NOT found on this system.\n\n" + get_ffmpeg_help_text()
         FFmpegHelpDialog(self.root, text)
 
     def check_for_ffmpeg(self):
-        """Manually re-check for ffmpeg and update the status bar."""
-        from .ffmpeg_utils import _ffmpeg_path_cache, _ffprobe_path_cache
         import simmovimaker.ffmpeg_utils as _fu
-        # Reset caches to force a fresh search
         _fu._ffmpeg_path_cache = None
         _fu._ffprobe_path_cache = None
         self.status_var.set("Checking for FFmpeg...")
@@ -2264,18 +3037,13 @@ KEYBOARD SHORTCUTS
 
 
 # ---------------------------------------------------------------------------
-# Entry point (for running the GUI directly)
+# Entry point
 # ---------------------------------------------------------------------------
 
 def main():
     root = tk.Tk()
-
-    # Set minimum size
-    root.minsize(800, 600)
-
-    # Create and run the application
+    root.minsize(900, 700)
     app = SimMovieMaker(root)
-
     root.mainloop()
     return 0
 
