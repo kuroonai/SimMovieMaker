@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "SimMovieMaker"
+version = "2.0.0"
+requires-python = ">=3.9"
+dependencies = [
+    "opencv-python",
+    "numpy",
+    "Pillow",
+]
+
+[project.scripts]
+simmovimaker = "simmovimaker.__main__:main"
+
+[project.gui-scripts]
+simmovimaker-gui = "simmovimaker.__main__:main"

@@ -1,0 +1,37 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# PyInstaller
+*.spec
+
+# Nuitka
+*.dist/
+.nuitka/
+
+# Installer output
+installer/*.exe
+
+# Virtual environments
+.env
+.venv
+venv/
+
+# Logs
+*.log
+
+# IDE settings
+.idea/
+.vscode/
+!.vscode/settings.json
+
+# Temporary files
+*.tmp
+*.temp

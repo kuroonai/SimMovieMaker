@@ -1,0 +1,12 @@
+name: smm
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pip
+  - pip:
+    - opencv-python
+    - Pillow
+    - nuitka
+    - ordered-set
