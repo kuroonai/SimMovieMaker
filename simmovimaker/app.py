@@ -16,10 +16,13 @@ from PIL import Image, ImageTk
 import json
 import threading
 import queue
+import subprocess
 import time
 from datetime import datetime
 
-from .ffmpeg_utils import check_ffmpeg, get_ffmpeg_help_text, FFmpegNotFoundError
+from .ffmpeg_utils import (
+    check_ffmpeg, get_ffmpeg_help_text, FFmpegNotFoundError, find_ffplay,
+)
 from . import video_ops
 from .dialogs import (
     ProgressDialog, VideoInfoDialog, MetadataDialog, SplitVideoDialog,
@@ -365,7 +368,8 @@ class SimMovieMaker:
         # Playback state
         self._playback_active = False
         self._playback_after_id = None
-        self._playback_cap = None           # cv2.VideoCapture during video playback
+        self._playback_cap = None           # cv2.VideoCapture for frame stepping
+        self._playback_process = None       # ffplay subprocess for audio playback
         self._playback_fps = 30.0
         self._playback_frame_idx = 0
         self._playback_total_frames = 0
@@ -527,13 +531,75 @@ class SimMovieMaker:
     # ------------------------------------------------------------------
 
     def create_layout(self):
+        # Status bar FIRST so it claims BOTTOM before anything else
+        self.status_var = tk.StringVar(value="Starting up...")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var,
+                               relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Video tools bar (above status bar, below everything else)
+        tools_bar = ttk.Frame(self.root, padding=(4, 3))
+        tools_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        ttk.Label(tools_bar, text="Video Tools:",
+                  font=("TkDefaultFont", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+
+        ttk.Button(tools_bar, text="Merge",
+                   command=self.merge_videos).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tools_bar, text="Split",
+                   command=self.split_video).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tools_bar, text="Trim",
+                   command=self.trim_video).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tools_bar, text="Mute Audio",
+                   command=self.mute_audio).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tools_bar, text="Extract Audio",
+                   command=self.extract_audio).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tools_bar, text="Add Audio",
+                   command=self.add_audio).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tools_bar, text="Speed",
+                   command=self.change_speed).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tools_bar, text="Extract Frames",
+                   command=self.extract_frames).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tools_bar, text="Convert",
+                   command=self.convert_format).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tools_bar, text="GIF",
+                   command=self.create_gif).pack(side=tk.LEFT, padx=2)
+
+        # Separator before metadata
+        ttk.Separator(tools_bar, orient=tk.VERTICAL).pack(
+            side=tk.LEFT, fill=tk.Y, padx=6, pady=2)
+
+        # Strip Metadata dropdown button
+        self._strip_meta_var = tk.StringVar(value="Strip Metadata")
+        strip_meta_mb = ttk.Menubutton(tools_bar, text="Strip Metadata",
+                                       direction="above")
+        strip_meta_menu = tk.Menu(strip_meta_mb, tearoff=0)
+        strip_meta_menu.add_command(
+            label="Fast (stream copy)",
+            command=self.strip_metadata)
+        strip_meta_menu.add_command(
+            label="Deep (re-encode, removes everything)",
+            command=self.strip_metadata_deep)
+        strip_meta_menu.add_separator()
+        strip_meta_menu.add_command(
+            label="View Metadata",
+            command=self.view_metadata)
+        strip_meta_menu.add_command(
+            label="Edit Metadata",
+            command=self.edit_metadata)
+        strip_meta_mb.config(menu=strip_meta_menu)
+        strip_meta_mb.pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(tools_bar, text="Info",
+                   command=self.view_metadata).pack(side=tk.LEFT, padx=2)
+
         # Main container using grid for weight control
         main = ttk.Frame(self.root)
-        main.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        main.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 2))
         main.rowconfigure(0, weight=3)   # preview
         main.rowconfigure(1, weight=0)   # transport controls
         main.rowconfigure(2, weight=0)   # thumbnail strip
-        main.rowconfigure(3, weight=1)   # bottom panel (list + props)
+        main.rowconfigure(3, weight=1, minsize=120)  # bottom panel
         main.columnconfigure(0, weight=1)
 
         # ---- ROW 0: Preview canvas ----
@@ -554,9 +620,8 @@ class SimMovieMaker:
         # ---- ROW 1: Transport controls ----
         transport = ttk.Frame(main)
         transport.grid(row=1, column=0, sticky="ew", pady=2)
-        transport.columnconfigure(1, weight=1)  # slider stretches
+        transport.columnconfigure(1, weight=1)
 
-        # Row 1a: buttons + time + slider
         btn_row = ttk.Frame(transport)
         btn_row.pack(fill=tk.X)
 
@@ -625,7 +690,7 @@ class SimMovieMaker:
         self.file_listbox.config(yscrollcommand=lb_scroll.set)
 
         btn_bar = ttk.Frame(list_frame)
-        btn_bar.pack(fill=tk.X, pady=4)
+        btn_bar.pack(fill=tk.X, pady=(3, 0))
 
         ttk.Button(btn_bar, text="Add Files",
                    command=self.import_images).pack(side=tk.LEFT, padx=2)
@@ -679,12 +744,6 @@ class SimMovieMaker:
 
         ttk.Button(props_frame, text="Create Video",
                    command=self.create_video).pack(anchor=tk.E, padx=(4, 0), pady=4)
-
-        # ---- Status bar ----
-        self.status_var = tk.StringVar(value="Starting up...")
-        status_bar = ttk.Label(self.root, textvariable=self.status_var,
-                               relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     # ------------------------------------------------------------------
     # Thumbnail strip callbacks
@@ -888,7 +947,84 @@ class SimMovieMaker:
             self._position_var.set(idx / (total - 1) * 100)
 
     def _start_video_playback(self, path):
-        """Start playing a video file frame by frame."""
+        """Play a video with audio using ffplay (external player window).
+        Falls back to cv2 frame-by-frame if ffplay is not available."""
+        # Populate video info for frame stepping
+        cap = cv2.VideoCapture(path)
+        if cap.isOpened():
+            self._playback_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            self._playback_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            self._playback_duration = (self._playback_total_frames / self._playback_fps
+                                       if self._playback_fps > 0 else 0)
+            cap.release()
+
+        ffplay_path = find_ffplay()
+        if ffplay_path:
+            self._start_ffplay(path, ffplay_path)
+        else:
+            # Fallback: cv2 frame-by-frame (no audio)
+            self._start_cv2_playback(path)
+
+    def _start_ffplay(self, path, ffplay_path):
+        """Launch ffplay as a subprocess for full playback with audio."""
+        # Kill any existing ffplay process
+        self._kill_ffplay()
+
+        # Build start position arg
+        seek_args = []
+        if self._playback_frame_idx > 0 and self._playback_fps > 0:
+            start_t = self._playback_frame_idx / self._playback_fps
+            seek_args = ["-ss", f"{start_t:.2f}"]
+
+        cmd = [
+            ffplay_path,
+            "-autoexit",           # close when video ends
+            "-window_title", f"SimMovieMaker - {os.path.basename(path)}",
+        ] + seek_args + [path]
+
+        try:
+            self._playback_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._playback_active = True
+            self._play_btn.config(text="Stop")
+            self.status_var.set(f"Playing: {os.path.basename(path)} (with audio)")
+            # Poll for ffplay exit so we can reset the button
+            self._poll_ffplay()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to launch ffplay: {e}")
+
+    def _poll_ffplay(self):
+        """Check if the ffplay process has exited."""
+        if self._playback_process is None:
+            return
+        ret = self._playback_process.poll()
+        if ret is not None:
+            # ffplay exited
+            self._playback_process = None
+            self._playback_active = False
+            self._play_btn.config(text="Play")
+            self.status_var.set("Playback finished")
+        else:
+            self._playback_after_id = self.root.after(200, self._poll_ffplay)
+
+    def _kill_ffplay(self):
+        """Terminate any running ffplay process."""
+        if self._playback_process is not None:
+            try:
+                self._playback_process.terminate()
+                self._playback_process.wait(timeout=2)
+            except Exception:
+                try:
+                    self._playback_process.kill()
+                except Exception:
+                    pass
+            self._playback_process = None
+
+    def _start_cv2_playback(self, path):
+        """Fallback: play video frame-by-frame with cv2 (no audio)."""
         if self._playback_cap is not None:
             self._playback_cap.release()
 
@@ -898,21 +1034,17 @@ class SimMovieMaker:
             return
 
         self._playback_cap = cap
-        self._playback_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        self._playback_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        self._playback_duration = (self._playback_total_frames / self._playback_fps
-                                   if self._playback_fps > 0 else 0)
-
-        # Seek to current position if resuming
         if self._playback_frame_idx > 0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, self._playback_frame_idx)
 
         self._playback_active = True
         self._play_btn.config(text="Pause")
         self._position_slider.config(to=100)
-        self._video_playback_tick()
+        self.status_var.set(
+            f"Playing: {os.path.basename(path)} (no audio - ffplay not found)")
+        self._cv2_playback_tick()
 
-    def _video_playback_tick(self):
+    def _cv2_playback_tick(self):
         if not self._playback_active or self._playback_cap is None:
             return
 
@@ -929,7 +1061,7 @@ class SimMovieMaker:
 
         interval = max(1, int(1000 / self._playback_fps))
         self._playback_after_id = self.root.after(interval,
-                                                  self._video_playback_tick)
+                                                  self._cv2_playback_tick)
 
     def _update_transport_display_video(self):
         if self._playback_fps <= 0:
@@ -948,6 +1080,8 @@ class SimMovieMaker:
         if self._playback_after_id:
             self.root.after_cancel(self._playback_after_id)
             self._playback_after_id = None
+        # For ffplay, stop means kill (ffplay has no pause via subprocess)
+        self._kill_ffplay()
 
     def _stop_playback(self):
         self._pause_playback()
@@ -955,6 +1089,7 @@ class SimMovieMaker:
         if self._playback_cap is not None:
             self._playback_cap.release()
             self._playback_cap = None
+        self._kill_ffplay()
         self._position_var.set(0)
         self._time_label.config(
             text=f"0:00 / {_format_time_short(self._playback_duration)}")

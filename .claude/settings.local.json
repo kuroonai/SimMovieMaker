@@ -6,7 +6,8 @@
       "Bash(python -c \"from simmovimaker import __version__; print\\(__version__\\)\")",
       "Bash(python -c \"import py_compile; py_compile.compile\\(''simmovimaker/app.py'', doraise=True\\); print\\(''Syntax OK''\\)\")",
       "Bash(cp smm.ico assets/smm.ico)",
-      "Bash(ls -la *.py *.bat *.iss *.yml *.toml)"
+      "Bash(ls -la *.py *.bat *.iss *.yml *.toml)",
+      "Bash(C:/ffmpeg/bin/ffplay.exe -version)"
     ]
   }
 }

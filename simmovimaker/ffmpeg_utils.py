@@ -22,6 +22,7 @@ class FFmpegNotFoundError(Exception):
 # an empty string means "searched but not found".
 _ffmpeg_path_cache = None
 _ffprobe_path_cache = None
+_ffplay_path_cache = None
 
 # Common installation directories on Windows (without the trailing executable
 # name). Each entry should point to a directory that directly contains the
@@ -75,6 +76,18 @@ def find_ffmpeg() -> str | None:
     return _ffmpeg_path_cache or None
 
 
+def find_ffplay() -> str | None:
+    """Locate the ffplay executable (bundled with most ffmpeg distributions).
+
+    Returns the absolute path or ``None``.
+    """
+    global _ffplay_path_cache
+    if _ffplay_path_cache is None:
+        result = _search_executable("ffplay")
+        _ffplay_path_cache = result if result else ""
+    return _ffplay_path_cache or None
+
+
 def find_ffprobe() -> str | None:
     """Locate the ffprobe executable.
 
@@ -116,6 +129,7 @@ def check_ffmpeg() -> dict:
     """
     ffmpeg_path = find_ffmpeg()
     ffprobe_path = find_ffprobe()
+    ffplay_path = find_ffplay()
     version = ""
     if ffmpeg_path:
         version = _get_version(ffmpeg_path)
@@ -124,6 +138,7 @@ def check_ffmpeg() -> dict:
         "available": bool(ffmpeg_path and ffprobe_path),
         "ffmpeg_path": ffmpeg_path,
         "ffprobe_path": ffprobe_path,
+        "ffplay_path": ffplay_path,
         "version": version,
     }
 
