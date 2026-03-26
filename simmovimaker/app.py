@@ -374,6 +374,8 @@ class SimMovieMaker:
         self._playback_frame_idx = 0
         self._playback_total_frames = 0
         self._playback_duration = 0.0       # seconds
+        self._playback_start_time = 0.0     # wall-clock time when playback started
+        self._playback_start_frame = 0      # frame index at playback start
         self._slider_dragging = False
 
         # Crop-region drawing state
@@ -677,6 +679,22 @@ class SimMovieMaker:
 
         ttk.Label(list_frame, text="Media Files").pack(anchor=tk.W, pady=(0, 3))
 
+        # Pack button bar BEFORE the listbox so it gets guaranteed space
+        btn_bar = ttk.Frame(list_frame)
+        btn_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(3, 0))
+
+        ttk.Button(btn_bar, text="Add Images",
+                   command=self.import_images).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_bar, text="Add Videos",
+                   command=self.import_videos).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_bar, text="Remove",
+                   command=self.delete_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_bar, text="Up", width=3,
+                   command=lambda: self.move_selected(-1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_bar, text="Down", width=3,
+                   command=lambda: self.move_selected(1)).pack(side=tk.LEFT, padx=2)
+
+        # Listbox fills remaining space
         lb_frame = ttk.Frame(list_frame)
         lb_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -688,20 +706,6 @@ class SimMovieMaker:
                                   command=self.file_listbox.yview)
         lb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.file_listbox.config(yscrollcommand=lb_scroll.set)
-
-        btn_bar = ttk.Frame(list_frame)
-        btn_bar.pack(fill=tk.X, pady=(3, 0))
-
-        ttk.Button(btn_bar, text="Add Files",
-                   command=self.import_images).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_bar, text="Add Videos",
-                   command=self.import_videos).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_bar, text="Remove",
-                   command=self.delete_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_bar, text="Up", width=3,
-                   command=lambda: self.move_selected(-1)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_bar, text="Down", width=3,
-                   command=lambda: self.move_selected(1)).pack(side=tk.LEFT, padx=2)
 
         # -- Right: properties --
         props_frame = ttk.Frame(bottom)
@@ -947,39 +951,56 @@ class SimMovieMaker:
             self._position_var.set(idx / (total - 1) * 100)
 
     def _start_video_playback(self, path):
-        """Play a video with audio using ffplay (external player window).
-        Falls back to cv2 frame-by-frame if ffplay is not available."""
-        # Populate video info for frame stepping
+        """Play video in the preview canvas with cv2 frames + background audio
+        via ffplay -nodisp (no popup window)."""
+        if self._playback_cap is not None:
+            self._playback_cap.release()
+
         cap = cv2.VideoCapture(path)
-        if cap.isOpened():
-            self._playback_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            self._playback_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            self._playback_duration = (self._playback_total_frames / self._playback_fps
-                                       if self._playback_fps > 0 else 0)
-            cap.release()
+        if not cap.isOpened():
+            messagebox.showerror("Error", f"Cannot open video: {path}")
+            return
 
-        ffplay_path = find_ffplay()
-        if ffplay_path:
-            self._start_ffplay(path, ffplay_path)
-        else:
-            # Fallback: cv2 frame-by-frame (no audio)
-            self._start_cv2_playback(path)
+        self._playback_cap = cap
+        self._playback_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        self._playback_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self._playback_duration = (self._playback_total_frames / self._playback_fps
+                                   if self._playback_fps > 0 else 0)
 
-    def _start_ffplay(self, path, ffplay_path):
-        """Launch ffplay as a subprocess for full playback with audio."""
-        # Kill any existing ffplay process
-        self._kill_ffplay()
-
-        # Build start position arg
-        seek_args = []
-        if self._playback_frame_idx > 0 and self._playback_fps > 0:
+        # Seek to current position if resuming
+        start_t = 0.0
+        if self._playback_frame_idx > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, self._playback_frame_idx)
             start_t = self._playback_frame_idx / self._playback_fps
+
+        # Start background audio via ffplay -nodisp (no popup window)
+        self._start_background_audio(path, start_t)
+
+        self._playback_active = True
+        self._play_btn.config(text="Pause")
+        self._position_slider.config(to=100)
+        has_audio = " (with audio)" if self._playback_process else ""
+        self.status_var.set(f"Playing: {os.path.basename(path)}{has_audio}")
+        self._playback_start_time = time.monotonic()
+        self._playback_start_frame = self._playback_frame_idx
+        self._video_playback_tick()
+
+    def _start_background_audio(self, path, start_t=0.0):
+        """Launch ffplay in audio-only mode (no video window) as background."""
+        self._kill_ffplay()
+        ffplay_path = find_ffplay()
+        if not ffplay_path:
+            return
+
+        seek_args = []
+        if start_t > 0.1:
             seek_args = ["-ss", f"{start_t:.2f}"]
 
         cmd = [
             ffplay_path,
-            "-autoexit",           # close when video ends
-            "-window_title", f"SimMovieMaker - {os.path.basename(path)}",
+            "-nodisp",         # no video display window
+            "-autoexit",       # exit when done
+            "-vn",             # disable video decoding (audio only)
         ] + seek_args + [path]
 
         try:
@@ -988,30 +1009,11 @@ class SimMovieMaker:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            self._playback_active = True
-            self._play_btn.config(text="Stop")
-            self.status_var.set(f"Playing: {os.path.basename(path)} (with audio)")
-            # Poll for ffplay exit so we can reset the button
-            self._poll_ffplay()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to launch ffplay: {e}")
-
-    def _poll_ffplay(self):
-        """Check if the ffplay process has exited."""
-        if self._playback_process is None:
-            return
-        ret = self._playback_process.poll()
-        if ret is not None:
-            # ffplay exited
+        except Exception:
             self._playback_process = None
-            self._playback_active = False
-            self._play_btn.config(text="Play")
-            self.status_var.set("Playback finished")
-        else:
-            self._playback_after_id = self.root.after(200, self._poll_ffplay)
 
     def _kill_ffplay(self):
-        """Terminate any running ffplay process."""
+        """Terminate any running ffplay audio process."""
         if self._playback_process is not None:
             try:
                 self._playback_process.terminate()
@@ -1023,30 +1025,20 @@ class SimMovieMaker:
                     pass
             self._playback_process = None
 
-    def _start_cv2_playback(self, path):
-        """Fallback: play video frame-by-frame with cv2 (no audio)."""
-        if self._playback_cap is not None:
-            self._playback_cap.release()
-
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            messagebox.showerror("Error", f"Cannot open video: {path}")
-            return
-
-        self._playback_cap = cap
-        if self._playback_frame_idx > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, self._playback_frame_idx)
-
-        self._playback_active = True
-        self._play_btn.config(text="Pause")
-        self._position_slider.config(to=100)
-        self.status_var.set(
-            f"Playing: {os.path.basename(path)} (no audio - ffplay not found)")
-        self._cv2_playback_tick()
-
-    def _cv2_playback_tick(self):
+    def _video_playback_tick(self):
         if not self._playback_active or self._playback_cap is None:
             return
+
+        # Calculate which frame we SHOULD be on based on elapsed wall-clock time
+        # This skips frames if rendering is too slow, keeping audio in sync
+        elapsed = time.monotonic() - self._playback_start_time
+        target_frame = self._playback_start_frame + int(elapsed * self._playback_fps)
+
+        current_frame = int(self._playback_cap.get(cv2.CAP_PROP_POS_FRAMES))
+
+        # Skip ahead if we've fallen behind by more than 2 frames
+        if target_frame > current_frame + 2:
+            self._playback_cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
 
         ret, frame = self._playback_cap.read()
         if not ret:
@@ -1059,9 +1051,10 @@ class SimMovieMaker:
         self._display_cv2_frame(frame)
         self._update_transport_display_video()
 
+        # Schedule next frame - aim for video fps but min 1ms
         interval = max(1, int(1000 / self._playback_fps))
         self._playback_after_id = self.root.after(interval,
-                                                  self._cv2_playback_tick)
+                                                  self._video_playback_tick)
 
     def _update_transport_display_video(self):
         if self._playback_fps <= 0:
